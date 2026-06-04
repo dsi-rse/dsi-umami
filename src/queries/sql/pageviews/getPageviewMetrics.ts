@@ -1,8 +1,9 @@
 import clickhouse from '@/lib/clickhouse';
 import { EVENT_COLUMNS, FILTER_COLUMNS, SESSION_COLUMNS } from '@/lib/constants';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetPageviewMetrics from '@/queries/sqlite/pageviews/getPageviewMetrics';
 
 const FUNCTION_NAME = 'getPageviewMetrics';
 
@@ -23,6 +24,7 @@ export async function getPageviewMetrics(
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetPageviewMetrics(...args),
   });
 }
 

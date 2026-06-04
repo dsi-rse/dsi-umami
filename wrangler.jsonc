@@ -1,0 +1,46 @@
+/**
+ * Cloudflare Workers config for umami via @opennextjs/cloudflare.
+ *
+ * Local dev with bindings:  pnpm cf:preview
+ * Deploy:                   pnpm cf:deploy
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "umami",
+	"main": ".open-next/worker.js",
+	"compatibility_date": "2025-12-01",
+	"compatibility_flags": [
+		"nodejs_compat",
+		"global_fetch_strictly_public"
+	],
+	"assets": {
+		"binding": "ASSETS",
+		"directory": ".open-next/assets"
+	},
+	"observability": {
+		"enabled": true
+	},
+	// D1 binding for the SQLite-backed umami database.
+	// Code references this as env.DB (see src/lib/prisma-d1.ts).
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "umami",
+			"database_id": "44c526d2-2153-47c5-b982-6751822949b6",
+			"migrations_dir": "prisma/migrations-d1",
+			"remote": true
+		}
+	],
+	// KV namespace used by src/lib/redis.ts shim (auth cache, SSO state).
+	// Code references this as env.CACHE (see src/lib/kv.ts).
+	"kv_namespaces": [
+		{
+			"binding": "CACHE",
+			"id": "03b7870a309a4b4abcc3e6a4546b0f86",
+			"remote": true
+		}
+	],
+	"vars": {
+		"DATABASE_FLAVOR": "d1"
+	}
+}

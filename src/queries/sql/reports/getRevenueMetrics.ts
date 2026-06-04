@@ -7,9 +7,10 @@ import {
   SOCIAL_DOMAINS,
   VIDEO_DOMAINS,
 } from '@/lib/constants';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetRevenueMetrics from '@/queries/sqlite/reports/getRevenueMetrics';
 import type { RevenuParameters } from './getRevenue';
 
 export interface RevenueMetricsResult {
@@ -25,6 +26,7 @@ export async function getRevenueMetrics(
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetRevenueMetrics(...args),
   });
 }
 

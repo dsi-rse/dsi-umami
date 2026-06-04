@@ -7,9 +7,10 @@ import {
   SOCIAL_DOMAINS,
   VIDEO_DOMAINS,
 } from '@/lib/constants';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetChannelMetrics from '@/queries/sqlite/getChannelMetrics';
 
 const FUNCTION_NAME = 'getChannelMetrics';
 
@@ -17,6 +18,7 @@ export async function getChannelMetrics(...args: [websiteId: string, filters?: Q
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetChannelMetrics(args[0], args[1] as QueryFilters),
   });
 }
 

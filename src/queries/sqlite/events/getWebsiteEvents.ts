@@ -1,0 +1,60 @@
+import prisma from '@/lib/prisma';
+import type { QueryFilters } from '@/lib/types';
+
+const FUNCTION_NAME = 'getWebsiteEvents';
+
+export async function sqliteGetWebsiteEvents(websiteId: string, filters: QueryFilters) {
+  const { pagedRawQuery, parseFilters } = prisma;
+  const { search } = filters;
+  const { filterQuery, dateQuery, cohortQuery, queryParams } = parseFilters({
+    ...filters,
+    websiteId,
+  });
+
+  const searchQuery = search
+    ? `and ((event_name LIKE {{search}} and event_type = 2)
+           or (url_path LIKE {{search}} and event_type = 1))`
+    : '';
+
+  return pagedRawQuery(
+    `
+    select
+      website_event.event_id as "id",
+      website_event.website_id as "websiteId",
+      website_event.session_id as "sessionId",
+      website_event.created_at as "createdAt",
+      website_event.hostname,
+      website_event.url_path as "urlPath",
+      website_event.url_query as "urlQuery",
+      website_event.referrer_path as "referrerPath",
+      website_event.referrer_query as "referrerQuery",
+      website_event.referrer_domain as "referrerDomain",
+      session.country as country,
+      city as city,
+      device as device,
+      os as os,
+      browser as browser,
+      page_title as "pageTitle",
+      website_event.event_type as "eventType",
+      website_event.event_name as "eventName",
+      event_id IN (select website_event_id
+                   from event_data
+                   where website_id = {{websiteId}}
+                      and created_at between {{startDate}} and {{endDate}}) AS "hasData"
+    from website_event
+    ${cohortQuery}
+    join session on session.session_id = website_event.session_id
+      and session.website_id = website_event.website_id
+    where website_event.website_id = {{websiteId}}
+    ${dateQuery}
+    ${filterQuery}
+    ${searchQuery}
+    order by website_event.created_at desc
+    `,
+    queryParams,
+    filters,
+    FUNCTION_NAME,
+  );
+}
+
+export default sqliteGetWebsiteEvents;

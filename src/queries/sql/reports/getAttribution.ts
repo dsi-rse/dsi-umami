@@ -1,8 +1,9 @@
 import clickhouse from '@/lib/clickhouse';
 import { EVENT_TYPE } from '@/lib/constants';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetAttribution from '@/queries/sqlite/reports/getAttribution';
 
 export interface AttributionParameters {
   startDate: Date;
@@ -29,6 +30,7 @@ export async function getAttribution(
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetAttribution(...args),
   });
 }
 

@@ -1,7 +1,8 @@
 import clickhouse from '@/lib/clickhouse';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetSessionReplays from '@/queries/sqlite/replays/getSessionReplays';
 
 const FUNCTION_NAME = 'getSessionReplays';
 
@@ -11,6 +12,7 @@ export function getSessionReplays(
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetSessionReplays(...args),
   });
 }
 

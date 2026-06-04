@@ -1,7 +1,8 @@
 import clickhouse from '@/lib/clickhouse';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetValues from '@/queries/sqlite/getValues';
 
 const FUNCTION_NAME = 'getValues';
 
@@ -11,6 +12,7 @@ export async function getValues(
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetValues(...args),
   });
 }
 

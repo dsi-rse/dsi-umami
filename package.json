@@ -46,7 +46,21 @@
     "seed-data": "tsx scripts/seed-data.ts",
     "lint": "biome lint .",
     "format": "biome format --write .",
-    "check": "biome check --write"
+    "check": "biome check --write",
+    "cf:dev": "CF_DEV=1 next dev --turbo",
+    "cf:build": "npm-run-all cf:gen-clients build-tracker build-recorder build-geo cf:build-app",
+    "cf:build-app": "opennextjs-cloudflare build",
+    "cf:gen-clients": "prisma generate && cross-env PRISMA_TARGET=d1 prisma generate",
+    "cf:preview": "opennextjs-cloudflare preview",
+    "cf:deploy": "opennextjs-cloudflare deploy",
+    "cf:upload": "opennextjs-cloudflare upload",
+    "cf:typegen": "wrangler types --env-interface CloudflareEnv ./cloudflare-env.d.ts",
+    "d1:migrate:local": "wrangler d1 migrations apply umami --local",
+    "d1:migrate:prod": "wrangler d1 migrations apply umami --remote",
+    "d1:import:dry-run": "tsx scripts/migrate-supabase-to-d1.ts --target=local --dry-run",
+    "d1:import:local": "tsx scripts/migrate-supabase-to-d1.ts --target=local",
+    "d1:import:remote": "tsx scripts/migrate-supabase-to-d1.ts --target=remote",
+    "check-d1-coverage": "node scripts/check-d1-coverage.js"
   },
   "cacheDirectories": [
     ".next/cache"
@@ -57,6 +71,8 @@
     "@dicebear/collection": "^9.4.2",
     "@dicebear/core": "^9.4.2",
     "@hello-pangea/dnd": "^17.0.0",
+    "@opennextjs/cloudflare": "^1.19.11",
+    "@prisma/adapter-d1": "^7.8.0",
     "@prisma/adapter-pg": "^7.6.0",
     "@prisma/client": "^7.6.0",
     "@prisma/extension-read-replicas": "^0.5.0",
@@ -156,6 +172,10 @@
     "tsup": "^8.5.0",
     "tsx": "^4.19.0",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.6"
-  }
+    "vitest": "^4.1.6",
+    "wrangler": "^4.97.0"
+  },
+  "workspaces": [
+    "**"
+  ]
 }

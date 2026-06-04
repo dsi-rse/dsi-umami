@@ -102,10 +102,19 @@ class UmamiRedisClient {
   }
 }
 
+import { getKVClient, isKVAvailable } from './kv';
+
 const REDIS = 'redis';
-const enabled = !!process.env.REDIS_URL;
+// When running on Cloudflare with the CACHE KV binding and no REDIS_URL,
+// transparently swap in the KV-backed shim. Same surface, eventual consistency.
+const useKVBackend = !process.env.REDIS_URL && isKVAvailable();
+const enabled = !!process.env.REDIS_URL || useKVBackend;
 
 function getClient() {
+  if (useKVBackend) {
+    return getKVClient() as unknown as UmamiRedisClient;
+  }
+
   const redis = new UmamiRedisClient(process.env.REDIS_URL);
   const originalConnect = redis.connect.bind(redis);
   let connectPromise: Promise<void> | null = null;

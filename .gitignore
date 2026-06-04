@@ -25,6 +25,13 @@ next-env.d.ts
 /src/generated
 pm2.yml
 
+# cloudflare / opennext
+.open-next
+.wrangler
+.dev.vars
+cloudflare-env.d.ts
+.migration
+
 # misc
 .DS_Store
 .idea

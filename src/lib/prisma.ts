@@ -4,11 +4,16 @@ import debug from 'debug';
 import { PrismaClient } from '@/generated/prisma/client';
 import { DEFAULT_PAGE_SIZE, FILTER_COLUMNS, OPERATORS, SESSION_COLUMNS } from './constants';
 import { filtersObjectToArray } from './params';
+import d1Module from './prisma-d1';
 import type { Operator, QueryFilters, QueryOptions } from './types';
 
 const log = debug('umami:prisma');
 
 const PRISMA = 'prisma';
+
+// When DATABASE_FLAVOR=d1, all helpers + client come from prisma-d1.ts and the
+// PG init below is skipped. Default (unset) keeps the upstream PG behavior.
+const IS_D1 = process.env.DATABASE_FLAVOR === 'd1';
 
 const PRISMA_LOG_OPTIONS = {
   log: [
@@ -415,22 +420,26 @@ function getClient() {
   return extended;
 }
 
-const client = (globalThis[PRISMA] || getClient()) as ReturnType<typeof getClient>;
+const client = IS_D1
+  ? (null as unknown as ReturnType<typeof getClient>)
+  : ((globalThis[PRISMA] || getClient()) as ReturnType<typeof getClient>);
 
-export default {
-  client,
-  transaction,
-  getAddIntervalQuery,
-  getCastColumnQuery,
-  getDayDiffQuery,
-  getDateSQL,
-  getDateWeeklySQL,
-  getFilterQuery,
-  getSearchParameters,
-  getTimestampDiffSQL,
-  getSearchSQL,
-  pagedQuery,
-  pagedRawQuery,
-  parseFilters,
-  rawQuery,
-};
+export default IS_D1
+  ? d1Module
+  : {
+      client,
+      transaction,
+      getAddIntervalQuery,
+      getCastColumnQuery,
+      getDayDiffQuery,
+      getDateSQL,
+      getDateWeeklySQL,
+      getFilterQuery,
+      getSearchParameters,
+      getTimestampDiffSQL,
+      getSearchSQL,
+      pagedQuery,
+      pagedRawQuery,
+      parseFilters,
+      rawQuery,
+    };

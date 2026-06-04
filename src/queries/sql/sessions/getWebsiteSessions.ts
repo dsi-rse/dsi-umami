@@ -1,8 +1,9 @@
 import clickhouse from '@/lib/clickhouse';
 import { EVENT_COLUMNS } from '@/lib/constants';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetWebsiteSessions from '@/queries/sqlite/sessions/getWebsiteSessions';
 
 const FUNCTION_NAME = 'getWebsiteSessions';
 
@@ -10,6 +11,7 @@ export async function getWebsiteSessions(...args: [websiteId: string, filters: Q
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetWebsiteSessions(...args),
   });
 }
 
