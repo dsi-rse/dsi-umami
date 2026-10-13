@@ -48,7 +48,7 @@
     "format": "biome format --write .",
     "check": "biome check --write",
     "cf:dev": "cross-env CF_DEV=1 DATABASE_FLAVOR=d1 next dev --turbo",
-    "cf:build": "npm-run-all check-d1-coverage check-drizzle-d1 cf:shims:pre cf:gen-clients build-tracker build-recorder cf:next-build cf:shims:post cf:build-app cf:shims:bundle cf:shims:restore cf:check-size",
+    "cf:build": "npm-run-all check-d1-coverage check-drizzle-d1 check-d1-import cf:shims:pre cf:gen-clients build-tracker build-recorder cf:next-build cf:shims:post cf:build-app cf:shims:bundle cf:shims:restore cf:check-size",
     "cf:next-build": "cross-env DATABASE_FLAVOR=d1 next build",
     "cf:build-app": "cross-env DATABASE_FLAVOR=d1 opennextjs-cloudflare build --skipNextBuild",
     "cf:gen-clients": "prisma generate",
@@ -67,7 +67,8 @@
     "d1:import:local": "tsx scripts/migrate-supabase-to-d1.ts --target=local",
     "d1:import:remote": "tsx scripts/migrate-supabase-to-d1.ts --target=remote",
     "check-d1-coverage": "node scripts/check-d1-coverage.js",
-    "check-drizzle-d1": "tsx scripts/check-drizzle-d1.ts"
+    "check-drizzle-d1": "tsx scripts/check-drizzle-d1.ts",
+    "check-d1-import": "tsx scripts/check-d1-import.ts"
   },
   "cacheDirectories": [
     ".next/cache"

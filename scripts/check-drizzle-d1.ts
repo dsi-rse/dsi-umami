@@ -235,10 +235,6 @@ try {
   await assert.rejects(client.user.findUnique({ where: { id: undefined } }), /where/);
   assert.throws(() => client.team.delete({ where: { id: undefined } }), /where/);
   assert.throws(() => client.team.update({ where: { id: undefined }, data: {} }), /where/);
-  await assert.rejects(
-    client.team.upsert({ where: { id: undefined }, create: {}, update: {} }),
-    /where/,
-  );
 
   // updateMany/deleteMany honor where and report real counts.
   assert.deepEqual(await client.team.updateMany({ where: { id: 't1' }, data: { logoUrl: 'x' } }), {
@@ -323,7 +319,7 @@ try {
 
   const userTeams = await q.getUserTeams('u1');
   assert.deepEqual(ids(userTeams.data), ['t1', 't2']);
-  const t2 = userTeams.data.find(t => t.id === 't2');
+  const t2: any = userTeams.data.find(t => t.id === 't2');
   assert.deepEqual(t2._count, { websites: 1, members: 2 });
   assert.deepEqual(t2.members.map(m => m.user.username).sort(), ['ann', 'bob']);
   assert.ok(t2.members.every(m => Object.keys(m.user).sort().join() === 'id,username'));

@@ -67,7 +67,7 @@ const db: DB = new Proxy({} as DB, {
 //
 // Coverage:
 //   ✓ findUnique, findFirst, findMany, create, createMany, update,
-//     updateMany, delete, deleteMany, count, upsert
+//     updateMany, delete, deleteMany, count (no upsert: nothing calls it)
 //   ✓ where: equality, null/notNull, in/notIn, gt/gte/lt/lte, contains,
 //     startsWith, endsWith, AND, OR, NOT, and the relation filters listed in
 //     RELATIONS. Unknown keys/operators throw.
@@ -514,21 +514,6 @@ function modelOps(modelName: string) {
       if (cond) q = q.where(cond);
       const rows: any[] = await q;
       return Number(rows[0]?.n ?? 0);
-    },
-    async upsert(args: any) {
-      ensureNoInclude(args, modelName, 'upsert');
-      const cond = requireCondition(buildCondition(table, args.where), modelName, 'upsert');
-      const existing: any[] = await db.select().from(table).where(cond).limit(1);
-      if (existing.length > 0) {
-        const [row]: any[] = await db
-          .update(table)
-          .set(prepareWriteData(args.update))
-          .where(cond)
-          .returning();
-        return row;
-      }
-      const [row]: any[] = await db.insert(table).values(prepareWriteData(args.create)).returning();
-      return row;
     },
   };
 }

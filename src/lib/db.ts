@@ -38,7 +38,7 @@ export async function runQuery(queries: any) {
   if (db === D1) {
     // Fall back to the PRISMA branch when no explicit D1 implementation is
     // provided. Most queries use prisma.{rawQuery,parseFilters,getDateSQL,...}
-    // which are dispatched to SQLite-flavored helpers via src/lib/prisma-d1.ts,
+    // which are dispatched to SQLite-flavored helpers via src/lib/drizzle-d1.ts,
     // so the PG-branch SQL is already SQLite-compatible. Files with inline PG
     // syntax (extract(epoch), date_trunc, ilike, ~*, ANY()) supply a [D1] key
     // pointing at a sibling in src/queries/sqlite/.
