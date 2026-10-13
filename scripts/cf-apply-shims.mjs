@@ -104,14 +104,16 @@ function replaceFile(file, content) {
   writeFileSync(file, content);
 }
 
-function applyStubs(root) {
+// Only node_modules needs originals kept: .next/standalone is a throwaway copy
+// of it (already stubbed by the time it's made).
+function applyStubs(root, keepOriginals) {
   if (!existsSync(root)) fail(`${root} does not exist`);
   const files = [...walk(root)];
   for (const target of TARGETS) {
     const matches = files.filter(target.match);
     if (matches.length === 0) fail(`no ${target.name} found under ${root}; update the shim`);
     for (const file of matches) {
-      if (!existsSync(file + ORIG)) {
+      if (keepOriginals && !existsSync(file + ORIG)) {
         // Stubbed by an older version of this script, with no original kept.
         if (readFileSync(file, 'utf8') === target.stub) {
           fail(`${file} is already stubbed with no backup; run \`pnpm install --force\` first`);
@@ -175,7 +177,8 @@ function checkSize() {
   if (kib > MAX_GZIP_KIB) fail('worker bundle is too close to the 10 MiB Workers limit');
 }
 
-if (args.root) applyStubs(path.resolve(cwd, args.root));
+if (args.root)
+  applyStubs(path.resolve(cwd, args.root), path.basename(args.root) === 'node_modules');
 else if (args.restore) restore(path.resolve(cwd, args.restore));
 else if (args['strip-bundle']) stripBundle();
 else if (args['check-size']) checkSize();
