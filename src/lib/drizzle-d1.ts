@@ -76,8 +76,8 @@ const db: DB = new Proxy({} as DB, {
 //   ✓ compound unique keys (`websiteId_visitId: { websiteId, visitId }`)
 //   ✓ orderBy (single column or array, asc/desc), take, skip, distinct
 //   ✓ top-level `select` / `omit` of columns (also on create/update returning)
-//   ✗ include, and select of relations/_count: throw. Those callers need an
-//     explicit Drizzle query (see src/queries/drizzle/).
+//   ✓ include (nested include, where, orderBy, scalar select/omit) and
+//     _count: { select } over RELATIONS, on find* (not on writes)
 
 const MODEL_TO_TABLE: Record<string, any> = {
   user: schema.user,
@@ -99,12 +99,19 @@ const MODEL_TO_TABLE: Record<string, any> = {
   sessionReplaySaved: schema.sessionReplaySaved,
 };
 
-// Relations reachable from upstream where-clauses:
+// Relations reachable from upstream where/include/_count clauses:
 // [target table, local column, target column, to-many]. Relation keys not
-// listed here throw in buildCondition instead of being dropped.
+// listed here throw instead of being dropped.
 type Relation = [any, string, string, boolean?];
 const RELATIONS = new Map<any, Record<string, Relation>>([
-  [schema.team, { members: [schema.teamUser, 'id', 'teamId', true] }],
+  [
+    schema.team,
+    {
+      members: [schema.teamUser, 'id', 'teamId', true],
+      websites: [schema.website, 'id', 'teamId', true],
+    },
+  ],
+  [schema.user, { websites: [schema.website, 'id', 'userId', true] }],
   [schema.teamUser, { user: [schema.user, 'userId', 'id'], team: [schema.team, 'teamId', 'id'] }],
   [
     schema.report,
@@ -252,11 +259,97 @@ function buildOrderBy(table: any, orderBy: any): any[] {
 
 function ensureNoInclude(args: any, model: string, op: string) {
   if (args?.include) {
-    throw new Error(
-      `drizzle-compat: client.${model}.${op}() with \`include\` is not supported. ` +
-        `Migrate the caller to an explicit Drizzle query (see src/db/d1/schema.ts).`,
-    );
+    throw new Error(`drizzle-compat: client.${model}.${op}() with \`include\` is not supported`);
   }
+}
+
+// Scalar `select` / `omit` on an included relation, applied after grouping
+// (the join column may not be selected).
+function pickColumns(table: any, row: any, { select, omit }: any) {
+  if (select) {
+    const cols = getTableColumns(table);
+    for (const k of Object.keys(select)) {
+      if (select[k] && !cols[k]) {
+        throw new Error(`drizzle-compat: can't select '${k}' on ${getTableName(table)}`);
+      }
+    }
+    return Object.fromEntries(Object.entries(row).filter(([k]) => select[k]));
+  }
+  if (omit) return Object.fromEntries(Object.entries(row).filter(([k]) => !omit[k]));
+  return row;
+}
+
+const relationFor = (table: any, key: string, what: string) => {
+  const relation = RELATIONS.get(table)?.[key];
+  if (!relation) {
+    throw new Error(`drizzle-compat: unsupported ${what} '${key}' on ${getTableName(table)}`);
+  }
+  return relation;
+};
+
+const joinKeys = (rows: any[], local: string) => [
+  ...new Set(rows.map(r => r[local]).filter(v => v !== null && v !== undefined)),
+];
+
+// Prisma `include` (nested include, where, orderBy, select/omit) and
+// `_count: { select }`. One batched query per relation per level, keyed by
+// the parent rows — no N+1.
+async function attachIncludes(table: any, rows: any[], include: Record<string, any>) {
+  for (const [key, spec] of Object.entries(include)) {
+    if (!spec || rows.length === 0) continue;
+    if (key === '_count') {
+      await attachCounts(table, rows, spec === true ? {} : (spec.select ?? {}));
+      continue;
+    }
+    const [target, local, remote, many] = relationFor(table, key, 'include');
+    const opts = spec === true ? {} : spec;
+    const keys = joinKeys(rows, local);
+    let related: any[] = [];
+    if (keys.length) {
+      let q: any = db
+        .select()
+        .from(target)
+        .where(and(WHERE_OPS.in(target[remote], keys), buildCondition(target, opts.where)));
+      const order = buildOrderBy(target, opts.orderBy);
+      if (order.length) q = q.orderBy(...order);
+      related = await q;
+      if (opts.include) await attachIncludes(target, related, opts.include);
+    }
+    const byKey = new Map<any, any[]>();
+    for (const r of related) {
+      if (!byKey.has(r[remote])) byKey.set(r[remote], []);
+      byKey.get(r[remote]).push(pickColumns(target, r, opts));
+    }
+    for (const row of rows) {
+      const matches = byKey.get(row[local]) ?? [];
+      row[key] = many ? matches : (matches[0] ?? null);
+    }
+  }
+}
+
+async function attachCounts(table: any, rows: any[], select: Record<string, any>) {
+  for (const row of rows) row._count ??= {};
+  for (const [key, spec] of Object.entries(select)) {
+    if (!spec) continue;
+    const [target, local, remote, many] = relationFor(table, key, '_count');
+    if (!many) throw new Error(`drizzle-compat: _count '${key}' needs a to-many relation`);
+    const keys = joinKeys(rows, local);
+    const where = spec === true ? undefined : spec.where;
+    const found: any[] = keys.length
+      ? await db
+          .select({ k: target[remote], n: sql<number>`count(*)` })
+          .from(target)
+          .where(and(WHERE_OPS.in(target[remote], keys), buildCondition(target, where)))
+          .groupBy(target[remote])
+      : [];
+    const byKey = new Map(found.map(f => [f.k, Number(f.n)]));
+    for (const row of rows) row._count[key] = byKey.get(row[local]) ?? 0;
+  }
+}
+
+async function withIncludes(table: any, rows: any[], args: any) {
+  if (args?.include) await attachIncludes(table, rows, args.include);
+  return rows;
 }
 
 // D1's bind() only accepts primitives. Drizzle's plain `text()` / `integer()`
@@ -291,13 +384,17 @@ function prepareWriteData(data: any): any {
 // op can span several statements (chunked createMany); they still commit
 // together.
 const BATCH = Symbol('drizzle-compat-batch');
-type BatchItem = { queries: any[]; map: (results: any[]) => any };
+type BatchItem = {
+  queries: any[];
+  map: (results: any[]) => any;
+  prelude?: () => Promise<void>;
+};
 
-function deferred(queries: any[], map: (results: any[]) => any) {
+function deferred(queries: any[], map: (results: any[]) => any, prelude?: () => Promise<void>) {
   let p: Promise<any> | undefined;
-  const run = () => (p ??= runBatch([{ queries, map }]).then(([res]) => res));
+  const run = () => (p ??= runBatch([{ queries, map, prelude }]).then(([res]) => res));
   return {
-    [BATCH]: { queries, map } as BatchItem,
+    [BATCH]: { queries, map, prelude } as BatchItem,
     // biome-ignore lint/suspicious/noThenProperty: intentionally thenable, like PrismaPromise
     then: (ok?: any, err?: any) => run().then(ok, err),
     catch: (err?: any) => run().catch(err),
@@ -325,24 +422,21 @@ function modelOps(modelName: string) {
   }
   return {
     async findUnique(args: any) {
-      ensureNoInclude(args, modelName, 'findUnique');
       const cond = requireCondition(buildCondition(table, args?.where), modelName, 'findUnique');
       const cols = projection(table, args, modelName, 'findUnique');
       const rows: any[] = await db.select(cols).from(table).where(cond).limit(1);
-      return rows[0] ?? null;
+      return (await withIncludes(table, rows, args))[0] ?? null;
     },
     async findFirst(args: any = {}) {
-      ensureNoInclude(args, modelName, 'findFirst');
       const cond = buildCondition(table, args?.where);
       const order = buildOrderBy(table, args?.orderBy);
       let q: any = db.select(projection(table, args, modelName, 'findFirst')).from(table);
       if (cond) q = q.where(cond);
       if (order.length) q = q.orderBy(...order);
       const rows: any[] = await q.limit(1);
-      return rows[0] ?? null;
+      return (await withIncludes(table, rows, args))[0] ?? null;
     },
     async findMany(args: any = {}) {
-      ensureNoInclude(args, modelName, 'findMany');
       const cond = buildCondition(table, args?.where);
       const order = buildOrderBy(table, args?.orderBy);
       let q: any = db.select(projection(table, args, modelName, 'findMany')).from(table);
@@ -351,11 +445,15 @@ function modelOps(modelName: string) {
       if (args?.distinct) {
         const skip = args.skip ?? 0;
         const rows = applyDistinct(await q, args.distinct);
-        return rows.slice(skip, args.take ? skip + args.take : undefined);
+        return withIncludes(
+          table,
+          rows.slice(skip, args.take ? skip + args.take : undefined),
+          args,
+        );
       }
       if (args?.take) q = q.limit(args.take);
       if (args?.skip) q = q.offset(args.skip);
-      return await q;
+      return withIncludes(table, await q, args);
     },
     create(args: any) {
       ensureNoInclude(args, modelName, 'create');
@@ -407,7 +505,8 @@ function modelOps(modelName: string) {
     deleteMany(args: any = {}) {
       const cond = buildCondition(table, args?.where);
       const q: any = db.delete(table);
-      return deferred([cond ? q.where(cond) : q], changes);
+      const prelude = BULK_TABLES.has(table) ? () => purgeInChunks(table, cond) : undefined;
+      return deferred([cond ? q.where(cond) : q], changes, prelude);
     },
     async count(args: any = {}) {
       const cond = buildCondition(table, args?.where);
@@ -798,7 +897,33 @@ function getSearchParameters(query: string, filters: Record<string, any>[]) {
   return { AND: { OR: params } };
 }
 
+// Analytics tables can hold millions of rows per website, and D1 stops a
+// query after 30 s, so a single DELETE (or the atomic batch around it) could
+// never finish. deleteMany on these tables first deletes in rowid chunks
+// outside the batch; the batch then removes whatever arrived meanwhile,
+// atomically with the rest of the transaction.
+const BULK_TABLES = new Set<any>([
+  schema.websiteEvent,
+  schema.eventData,
+  schema.sessionData,
+  schema.session,
+  schema.revenue,
+  schema.sessionReplay,
+]);
+const PURGE_CHUNK = 5000;
+
+async function purgeInChunks(table: any, cond: any) {
+  const filter = cond ?? sql`1`;
+  for (;;) {
+    const res: any = await db.run(
+      sql`delete from ${table} where rowid in (select rowid from ${table} where ${filter} limit ${PURGE_CHUNK})`,
+    );
+    if (!res?.meta?.changes) return;
+  }
+}
+
 async function runBatch(items: BatchItem[]) {
+  for (const item of items) await item.prelude?.();
   const queries = items.flatMap(i => i.queries);
   const results: any[] = queries.length ? await db.batch(queries as any) : [];
   let start = 0;

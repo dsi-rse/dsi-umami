@@ -24,8 +24,20 @@ const mf = new Miniflare({
   modules: true,
   compatibilityDate: '2025-12-01',
   script: 'export default { fetch: () => new Response() }',
-  d1Databases: ['DB'],
+  d1Databases: ['DB', 'E2E'],
 });
+
+async function migrate(db: any) {
+  for (const file of readdirSync(MIGRATIONS)
+    .filter(f => f.endsWith('.sql'))
+    .sort()) {
+    const ddl = readFileSync(`${MIGRATIONS}/${file}`, 'utf8')
+      .split(/;\s*\n/)
+      .map(s => s.replace(/^--.*$/gm, '').trim())
+      .filter(Boolean);
+    await db.batch(ddl.map(s => db.prepare(s)));
+  }
+}
 
 try {
   const db = await mf.getD1Database('DB');
@@ -268,6 +280,133 @@ try {
     transaction(async tx => tx.team.findMany({})),
     /findMany/,
   );
+
+  // ---- Upstream query functions end to end, on a fresh database ----
+  const e2e = await mf.getD1Database('E2E');
+  await migrate(e2e);
+  globalThis['drizzle-d1'] = drizzle(e2e as any, { schema });
+  process.env.DATABASE_FLAVOR = 'd1';
+  const q = await import('../src/queries/prisma');
+
+  // u1 owns t1 and website w1; u1 is a member of t2 (owned by u2), which has w3.
+  // u2 owns w2 directly. w4 is soft-deleted.
+  await transaction([
+    client.user.create({ data: { id: 'u1', username: 'ann', password: 'h1', role: 'admin' } }),
+    client.user.create({ data: { id: 'u2', username: 'bob', password: 'h2', role: 'user' } }),
+    client.team.create({ data: { id: 't1', name: 'one' } }),
+    client.team.create({ data: { id: 't2', name: 'two', accessCode: 'secret' } }),
+    client.teamUser.create({ data: { id: 'tu1', teamId: 't1', userId: 'u1', role: 'team-owner' } }),
+    client.teamUser.create({ data: { id: 'tu2', teamId: 't2', userId: 'u2', role: 'team-owner' } }),
+    client.teamUser.create({
+      data: { id: 'tu3', teamId: 't2', userId: 'u1', role: 'team-member' },
+    }),
+    client.website.create({ data: { id: 'w1', name: 'A', domain: 'a.com', userId: 'u1' } }),
+    client.website.create({ data: { id: 'w2', name: 'B', domain: 'b.org', userId: 'u2' } }),
+    client.website.create({
+      data: { id: 'w3', name: 'C', domain: 'c.net', teamId: 't2', createdBy: 'u2' },
+    }),
+    client.website.create({
+      data: { id: 'w4', name: 'D', userId: 'u1', deletedAt: new Date() },
+    }),
+    client.report.create({
+      data: {
+        id: 'r1',
+        userId: 'u1',
+        websiteId: 'w1',
+        type: 'funnel',
+        name: 'r',
+        description: '',
+        parameters: { steps: [] },
+      },
+    }),
+  ]);
+
+  const userTeams = await q.getUserTeams('u1');
+  assert.deepEqual(ids(userTeams.data), ['t1', 't2']);
+  const t2 = userTeams.data.find(t => t.id === 't2');
+  assert.deepEqual(t2._count, { websites: 1, members: 2 });
+  assert.deepEqual(t2.members.map(m => m.user.username).sort(), ['ann', 'bob']);
+  assert.ok(t2.members.every(m => Object.keys(m.user).sort().join() === 'id,username'));
+
+  // Login payload: only the selected columns (no accessCode) of the user's teams.
+  const loginTeams = await q.getAllUserTeams('u2');
+  assert.deepEqual(loginTeams, [{ id: 't2', name: 'two', logoUrl: null }]);
+
+  assert.deepEqual(ids((await q.getUserWebsites('u1')).data), ['w1']);
+  assert.deepEqual((await q.getUserWebsites('u1')).data[0].user, { username: 'ann', id: 'u1' });
+  assert.deepEqual(ids((await q.getAllUserWebsitesIncludingTeamOwner('u2')).data), ['w2', 'w3']);
+  assert.deepEqual(ids((await q.getAllUserWebsitesIncludingTeamOwner('u1')).data), ['w1']);
+  const teamSites = await q.getTeamWebsites('t2', {});
+  assert.deepEqual(teamSites.data[0].createUser, { id: 'u2', username: 'bob' });
+
+  const members = await q.getTeamUsers(
+    {
+      where: { teamId: 't2', user: { deletedAt: null } },
+      include: { user: { select: { id: true, username: true } } },
+      orderBy: { createdAt: 'asc' },
+    },
+    { search: 'bo' },
+  );
+  assert.deepEqual(
+    members.data.map(m => m.user),
+    [{ id: 'u2', username: 'bob' }],
+  );
+
+  const reports = await q.getUserReports('u1');
+  assert.deepEqual(reports.data[0].website, { domain: 'a.com', userId: 'u1' });
+
+  // Admin views (include + _count + omit).
+  const adminUsers = await q.getUsers(
+    {
+      include: { _count: { select: { websites: { where: { deletedAt: null } } } } },
+      omit: { password: true },
+      orderBy: { createdAt: 'desc' },
+    },
+    {},
+  );
+  assert.ok(adminUsers.data.every(u => !('password' in u)));
+  assert.deepEqual(adminUsers.data.find(u => u.id === 'u1')._count, { websites: 1 });
+  const adminSites = await q.getWebsites(
+    {
+      include: {
+        user: { where: { deletedAt: null }, select: { username: true, id: true } },
+        team: {
+          where: { deletedAt: null },
+          include: { members: { where: { role: 'team-owner' } } },
+        },
+      },
+    },
+    {},
+  );
+  const w3 = adminSites.data.find(w => w.id === 'w3');
+  assert.equal(w3.user, null);
+  assert.deepEqual(
+    w3.team.members.map(m => m.userId),
+    ['u2'],
+  );
+
+  // deleteWebsite purges analytics rows in chunks before the atomic batch.
+  const N = 12_000;
+  await e2e
+    .prepare(
+      `with recursive c(x) as (select 1 union all select x + 1 from c where x < ${N})
+       insert into website_event (event_id, website_id, session_id, visit_id, url_path, event_type, created_at)
+       select 'e' || x, 'w2', 's1', 'v1', '/', 1, '2026-01-01T00:00:00.000Z' from c`,
+    )
+    .run();
+  await client.session.create({ data: { id: 's1', websiteId: 'w2' } });
+  await q.deleteWebsite('w2');
+  assert.equal(await client.websiteEvent.count({ where: { websiteId: 'w2' } }), 0);
+  assert.equal(await client.session.count({ where: { websiteId: 'w2' } }), 0);
+  assert.equal(await client.website.findUnique({ where: { id: 'w2' } }), null);
+
+  // deleteUser removes only that user's websites, owned teams and memberships.
+  await q.deleteUser('u2');
+  assert.deepEqual(ids(await client.user.findMany({})), ['u1']);
+  assert.deepEqual(ids(await client.team.findMany({})), ['t1']);
+  assert.deepEqual(ids(await client.teamUser.findMany({})), ['tu1']);
+  assert.deepEqual(ids(await client.website.findMany({})), ['w1', 'w3', 'w4']);
+  assert.deepEqual(ids(await client.report.findMany({})), ['r1']);
 
   console.log('drizzle-d1 compat: OK');
 } finally {

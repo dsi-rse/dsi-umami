@@ -3,20 +3,15 @@ import { readReplicas } from '@prisma/extension-read-replicas';
 import debug from 'debug';
 import { PrismaClient } from '@/generated/prisma/client';
 import { DEFAULT_PAGE_SIZE, FILTER_COLUMNS, OPERATORS, SESSION_COLUMNS } from './constants';
-import { filtersObjectToArray } from './params';
-// Phase 7: D1 path moved from Prisma to Drizzle ORM.
-// Workers blocks runtime WASM compilation, which Prisma 7's D1 client requires.
-// prisma-d1.ts is retained for reference / non-Workers SQLite use, but is no
-// longer the default-export for DATABASE_FLAVOR=d1.
 import d1Module from './drizzle-d1';
+import { filtersObjectToArray } from './params';
 import type { Operator, QueryFilters, QueryOptions } from './types';
 
 const log = debug('umami:prisma');
 
 const PRISMA = 'prisma';
 
-// When DATABASE_FLAVOR=d1, all helpers + client come from prisma-d1.ts and the
-// PG init below is skipped. Default (unset) keeps the upstream PG behavior.
+// DATABASE_FLAVOR=d1 swaps in src/lib/drizzle-d1.ts (D1 fork, see D1_FORK.md).
 const IS_D1 = process.env.DATABASE_FLAVOR === 'd1';
 
 const PRISMA_LOG_OPTIONS = {
@@ -424,26 +419,25 @@ function getClient() {
   return extended;
 }
 
-const client = IS_D1
-  ? (null as unknown as ReturnType<typeof getClient>)
-  : ((globalThis[PRISMA] || getClient()) as ReturnType<typeof getClient>);
+const client = (IS_D1 ? null : globalThis[PRISMA] || getClient()) as ReturnType<typeof getClient>;
 
-export default IS_D1
-  ? d1Module
-  : {
-      client,
-      transaction,
-      getAddIntervalQuery,
-      getCastColumnQuery,
-      getDayDiffQuery,
-      getDateSQL,
-      getDateWeeklySQL,
-      getFilterQuery,
-      getSearchParameters,
-      getTimestampDiffSQL,
-      getSearchSQL,
-      pagedQuery,
-      pagedRawQuery,
-      parseFilters,
-      rawQuery,
-    };
+const pgModule = {
+  client,
+  transaction,
+  getAddIntervalQuery,
+  getCastColumnQuery,
+  getDayDiffQuery,
+  getDateSQL,
+  getDateWeeklySQL,
+  getFilterQuery,
+  getSearchParameters,
+  getTimestampDiffSQL,
+  getSearchSQL,
+  pagedQuery,
+  pagedRawQuery,
+  parseFilters,
+  rawQuery,
+};
+
+// `satisfies` fails the build if a PG helper has no D1 counterpart.
+export default IS_D1 ? (d1Module satisfies Record<keyof typeof pgModule, unknown>) : pgModule;
