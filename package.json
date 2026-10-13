@@ -48,7 +48,7 @@
     "format": "biome format --write .",
     "check": "biome check --write",
     "cf:dev": "cross-env CF_DEV=1 DATABASE_FLAVOR=d1 next dev --turbo",
-    "cf:build": "npm-run-all check-d1-coverage check-drizzle-d1 check-d1-import cf:shims:pre cf:gen-clients build-tracker build-recorder cf:next-build cf:shims:post cf:build-app cf:shims:bundle cf:shims:restore cf:check-size",
+    "cf:build": "npm-run-all cf:gen-clients check-d1-coverage check-drizzle-d1 check-d1-import cf:shims:pre build-tracker build-recorder cf:next-build cf:shims:post cf:build-app cf:shims:bundle cf:shims:restore cf:check-size",
     "cf:next-build": "cross-env DATABASE_FLAVOR=d1 next build",
     "cf:build-app": "cross-env DATABASE_FLAVOR=d1 opennextjs-cloudflare build --skipNextBuild",
     "cf:gen-clients": "prisma generate",

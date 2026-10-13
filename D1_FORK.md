@@ -16,20 +16,21 @@ pnpm cf:deploy     # wrangler deploy of .open-next/
 
 `pnpm cf:build` runs, in order:
 
-  1. `check-d1-coverage`  — PG-only SQL without a D1 sibling fails the build
-  2. `check-drizzle-d1`   — compat layer + upstream queries against in-memory D1
+  1. `cf:gen-clients`     — `prisma generate` (PG client; imported but unused on D1,
+                            and needed by the checks below)
+  2. `check-d1-coverage`  — PG-only SQL without a D1 sibling fails the build
+     `check-drizzle-d1`   — compat layer + upstream queries against in-memory D1
      `check-d1-import`    — import-script SQL generation against node:sqlite
   3. `cf:shims:pre`       — stub pg-cloudflare and the PG Prisma WASM in node_modules
-  4. `cf:gen-clients`     — `prisma generate` (PG client; imported but unused on D1)
-  5. `build-tracker`, `build-recorder` — `public/script.js`, `public/recorder.js`
-  6. `cf:next-build`      — `next build` with `DATABASE_FLAVOR=d1`
-  7. `cf:shims:post`      — same stubs in `.next/standalone/`
-  8. `cf:build-app`       — `opennextjs-cloudflare build --skipNextBuild`
-  9. `cf:shims:bundle`    — empty OpenNext's copy of `.env`, drop stray `.env*`/GeoLite
- 10. `cf:shims:restore`   — put node_modules back so the local Postgres path works
- 11. `cf:check-size`      — `wrangler deploy --dry-run`; fail above 9.5 MiB gzipped
+  4. `build-tracker`, `build-recorder` — `public/script.js`, `public/recorder.js`
+  5. `cf:next-build`      — `next build` with `DATABASE_FLAVOR=d1`
+  6. `cf:shims:post`      — same stubs in `.next/standalone/`
+  7. `cf:build-app`       — `opennextjs-cloudflare build --skipNextBuild`
+  8. `cf:shims:bundle`    — empty OpenNext's copy of `.env`, drop stray `.env*`/GeoLite
+  9. `cf:shims:restore`   — put node_modules back so the local Postgres path works
+ 10. `cf:check-size`      — `wrangler deploy --dry-run`; fail above 9.5 MiB gzipped
 
-If a build fails before step 10, run `pnpm cf:shims:restore` (or
+If a build fails before step 9, run `pnpm cf:shims:restore` (or
 `pnpm install --force`) before using the Postgres path locally.
 
 ### Required configuration
@@ -248,7 +249,8 @@ until you're past the point you'd roll back.
 
 ## After merging upstream
 
-- `pnpm check-d1-coverage`, `pnpm check-drizzle-d1`, `pnpm check-d1-import`,
+- `pnpm build-db-client` once (generates the Prisma client the checks import),
+  then `pnpm check-d1-coverage`, `pnpm check-drizzle-d1`, `pnpm check-d1-import`,
   `pnpm test` (includes `src/queries/sqlite/d1-smoke.test.ts`, which runs every
   `src/queries/sql/**` query on an in-memory SQLite with D1's limits and fails
   if a new upstream query isn't in its list)
