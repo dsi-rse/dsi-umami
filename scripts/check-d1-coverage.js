@@ -12,8 +12,7 @@
  * Run: pnpm check-d1-coverage (or node scripts/check-d1-coverage.js)
  */
 
-import { readFileSync, statSync } from 'node:fs';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -109,7 +108,9 @@ for (const file of walk(SQL_DIR)) {
 }
 
 if (problems > 0) {
-  console.error(`\n${problems} file(s) need D1 coverage. See plan: prisma-d1 helpers and src/queries/sqlite/_helpers.ts.`);
+  console.error(
+    `\n${problems} file(s) need D1 coverage. Add a sibling under src/queries/sqlite/ (see D1_FORK.md).`,
+  );
   process.exit(1);
 }
 

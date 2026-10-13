@@ -52,7 +52,13 @@ function statement(sql: string, params: any[] = []) {
         args.map(v => (typeof v === 'boolean' ? Number(v) : v)),
       );
     },
-    all: async () => ({ success: true, results: rows(), meta: {} }),
+    // Like D1, writes report meta.changes (batch() runs everything through all()).
+    all: async () => {
+      const stmt = sqlite.prepare(sql);
+      if (stmt.columns().length) return { success: true, results: rows(), meta: {} };
+      const { changes } = stmt.run(...params);
+      return { success: true, results: [], meta: { changes: Number(changes) } };
+    },
     raw: async () => rows(true),
     first: async (column?: string) => (column ? rows()[0]?.[column] : rows()[0]) ?? null,
     run: async () => ({ success: true, results: [], meta: sqlite.prepare(sql).run(...params) }),

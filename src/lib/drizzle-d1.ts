@@ -1,13 +1,13 @@
 /**
- * Drizzle-backed replacement for src/lib/prisma-d1.ts. Same default-export
- * shape (`{ client, transaction, rawQuery, parseFilters, getDateSQL, ... }`)
- * so src/lib/prisma.ts's dispatch and the existing src/queries/sql/ + sqlite/
- * call sites continue to work.
+ * D1 (SQLite) implementation of src/lib/prisma.ts's default export
+ * (`{ client, transaction, rawQuery, parseFilters, getDateSQL, ... }`), swapped
+ * in when DATABASE_FLAVOR=d1. `client` translates Prisma calls to Drizzle;
+ * the helpers emit SQLite. See D1_FORK.md.
  *
- * Why Drizzle and not Prisma: Cloudflare Workers blocks runtime
- * `new WebAssembly.Module()` ("Wasm code generation disallowed"). Prisma 7's
- * generated D1 client compiles a 4.6MB SQLite query-compiler WASM at request
- * time. Drizzle is hand-rolled JS with no WASM dependency on D1.
+ * Why Drizzle and not Prisma: Workers blocks runtime WebAssembly compilation,
+ * and Prisma 7's D1 client as generated here compiled its query engine at
+ * request time. Drizzle has no WASM. (D1_FORK.md notes an untried Prisma
+ * option.)
  */
 
 import { getCloudflareContext } from '@opennextjs/cloudflare';
@@ -537,9 +537,9 @@ const client = new Proxy({} as any, {
 
 // ---------- SQL fragment helpers (SQLite-flavored) ----------
 //
-// These match the prisma-d1.ts API. Existing src/queries/sqlite/*.ts and the
-// 12 src/queries/sql/*.ts dispatch points call these via `prisma.getDateSQL`
-// etc. — keep the names and signatures stable.
+// Same names and signatures as the PG helpers in src/lib/prisma.ts; the
+// queries in src/queries/sql/** and src/queries/sqlite/** call them through
+// `prisma.getDateSQL` etc.
 
 // Timestamps are stored as ISO strings ('YYYY-MM-DDTHH:MM:SS.sssZ'), and range
 // filters compare them as text, so date math has to produce the same format.
