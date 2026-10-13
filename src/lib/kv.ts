@@ -22,9 +22,14 @@ function getKV(): KVNamespace {
  * CACHE binding present.
  *
  * Semantics worth knowing:
- *   - KV is eventually consistent (~60s globally). Tokens may briefly survive
- *     a logout; acceptable here because JWT TTLs still bound the blast radius.
+ *   - KV is eventually consistent (~60s globally): a key deleted on logout can
+ *     still be read elsewhere for up to a minute. (Upstream logout deletes the
+ *     bearer token rather than `auth:<key>`, so tokens live until their TTL on
+ *     Redis too.)
  *   - Minimum TTL is 60s. Shorter TTLs are clamped up.
+ *   - Writes to the same key within 1s are rate limited (429). Cache fills in
+ *     fetch() and TTL bumps in expire() are therefore best-effort, so a busy
+ *     cold key can't fail the request; explicit set() still throws.
  *   - No atomic incr. rateLimit() is best-effort and racy under contention.
  */
 class UmamiKVClient {
@@ -61,7 +66,7 @@ class UmamiKVClient {
     // KV has no separate TTL update; round-trip the value with a new TTL.
     const value = await this.get(key);
     if (value === null) return;
-    await this.set(key, value, seconds);
+    await this.set(key, value, seconds).catch(err => log('kv expire error:', err));
   }
 
   async rateLimit(key: string, limit: number, seconds: number): Promise<boolean> {
@@ -80,7 +85,7 @@ class UmamiKVClient {
     if (!result && query) {
       const data = await query();
       if (data) {
-        await this.set(key, data, time);
+        await this.set(key, data, time).catch(err => log('kv cache fill error:', err));
       }
       return data;
     }

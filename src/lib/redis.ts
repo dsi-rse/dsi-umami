@@ -105,9 +105,11 @@ class UmamiRedisClient {
 import { getKVClient, isKVAvailable } from './kv';
 
 const REDIS = 'redis';
-// When running on Cloudflare with the CACHE KV binding and no REDIS_URL,
-// transparently swap in the KV-backed shim. Same surface, eventual consistency.
-const useKVBackend = !process.env.REDIS_URL && isKVAvailable();
+// Opt-in Workers KV stand-in for Redis (CACHE_BACKEND=kv, see D1_FORK.md).
+// Enabling it also enables umami's Redis-only behavior: 1-hour login tokens
+// and 24-hour website/link/pixel caches.
+const useKVBackend =
+  !process.env.REDIS_URL && process.env.CACHE_BACKEND === 'kv' && isKVAvailable();
 const enabled = !!process.env.REDIS_URL || useKVBackend;
 
 function getClient() {
