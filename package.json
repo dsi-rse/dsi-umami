@@ -79,7 +79,6 @@
     "@dicebear/core": "^9.4.2",
     "@hello-pangea/dnd": "^17.0.0",
     "@opennextjs/cloudflare": "^1.19.11",
-    "@prisma/adapter-d1": "^7.8.0",
     "@prisma/adapter-pg": "^7.6.0",
     "@prisma/client": "^7.6.0",
     "@prisma/extension-read-replicas": "^0.5.0",
@@ -161,8 +160,8 @@
     "cross-env": "^10.1.0",
     "cypress": "^13.6.6",
     "dotenv-cli": "^11.0.0",
-    "drizzle-kit": "^0.31.10",
     "jsdom": "^29.1.1",
+    "miniflare": "4.20260601.0",
     "postcss": "^8.5.10",
     "postcss-flexbugs-fixes": "^5.0.2",
     "postcss-import": "^15.1.0",
@@ -183,8 +182,5 @@
     "typescript": "^5.9.3",
     "vitest": "^4.1.6",
     "wrangler": "^4.97.0"
-  },
-  "workspaces": [
-    "**"
-  ]
+  }
 }
