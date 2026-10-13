@@ -11,12 +11,13 @@
  */
 
 import { getCloudflareContext } from '@opennextjs/cloudflare';
-import { type DrizzleD1Database, drizzle } from 'drizzle-orm/d1';
+import debug from 'debug';
 import {
   and,
   asc,
   desc,
   eq,
+  getTableName,
   gt,
   gte,
   inArray,
@@ -27,15 +28,14 @@ import {
   lte,
   ne,
   notInArray,
-  notLike,
   or,
   sql,
 } from 'drizzle-orm';
-import debug from 'debug';
+import { type DrizzleD1Database, drizzle } from 'drizzle-orm/d1';
+import * as schema from '@/db/d1/schema';
 import { DEFAULT_PAGE_SIZE, FILTER_COLUMNS, OPERATORS, SESSION_COLUMNS } from './constants';
 import { filtersObjectToArray } from './params';
 import type { Operator, QueryFilters, QueryOptions } from './types';
-import * as schema from '@/db/d1/schema';
 
 const log = debug('umami:drizzle-d1');
 
@@ -69,7 +69,10 @@ const db: DB = new Proxy({} as DB, {
 //   ✓ findUnique, findFirst, findMany, create, createMany, update,
 //     updateMany, delete, deleteMany, count, upsert
 //   ✓ where: equality, null/notNull, in/notIn, gt/gte/lt/lte, contains,
-//     startsWith, endsWith, AND, OR, NOT
+//     startsWith, endsWith, AND, OR, NOT, and the relation filters listed in
+//     RELATIONS. Unknown keys/operators throw.
+//   ✓ transaction([...]) and transaction(async tx => ...) as one atomic
+//     db.batch() (writes only)
 //   ✓ orderBy (single column or array, asc/desc), take, skip, distinct
 //   △ select: returns the same row shape (Drizzle returns all columns); the
 //     caller's destructuring works because field names match
@@ -96,56 +99,108 @@ const MODEL_TO_TABLE: Record<string, any> = {
   sessionReplaySaved: schema.sessionReplaySaved,
 };
 
+// Relations reachable from upstream where-clauses:
+// [target table, local column, target column, to-many]. Relation keys not
+// listed here throw in buildCondition instead of being dropped.
+type Relation = [any, string, string, boolean?];
+const RELATIONS = new Map<any, Record<string, Relation>>([
+  [schema.team, { members: [schema.teamUser, 'id', 'teamId', true] }],
+  [schema.teamUser, { user: [schema.user, 'userId', 'id'], team: [schema.team, 'teamId', 'id'] }],
+  [
+    schema.report,
+    { user: [schema.user, 'userId', 'id'], website: [schema.website, 'websiteId', 'id'] },
+  ],
+  [
+    schema.website,
+    {
+      user: [schema.user, 'userId', 'id'],
+      createUser: [schema.user, 'createdBy', 'id'],
+      team: [schema.team, 'teamId', 'id'],
+    },
+  ],
+]);
+
+const WHERE_OPS: Record<string, (col: any, v: any) => any> = {
+  equals: (c, v) => (v === null ? isNull(c) : eq(c, bindable(v))),
+  not: (c, v) => (v === null ? isNotNull(c) : ne(c, bindable(v))),
+  in: (c, v) => inArray(c, v.map(bindable)),
+  notIn: (c, v) => notInArray(c, v.map(bindable)),
+  gt: (c, v) => gt(c, bindable(v)),
+  gte: (c, v) => gte(c, bindable(v)),
+  lt: (c, v) => lt(c, bindable(v)),
+  lte: (c, v) => lte(c, bindable(v)),
+  // SQLite LIKE is already case-insensitive for ASCII, so `mode` is ignored.
+  contains: (c, v) => like(c, `%${v}%`),
+  startsWith: (c, v) => like(c, `${v}%`),
+  endsWith: (c, v) => like(c, `%${v}`),
+};
+
+// Prisma relation filter → correlated EXISTS. To-one relations take a nested
+// where (or null); to-many relations take `{ some: where }`.
+function relationCondition(
+  table: any,
+  key: string,
+  [target, local, remote, many]: Relation,
+  value: any,
+) {
+  if (!many && value === null) return isNull(table[local]);
+  if (many && !(value && Object.keys(value).length === 1 && 'some' in value)) {
+    throw new Error(`drizzle-compat: only \`${key}: { some }\` is supported for to-many relations`);
+  }
+  const link = eq(target[remote], table[local]);
+  const inner = buildCondition(target, many ? value.some : value);
+  return sql`exists (select 1 from ${target} where ${inner ? and(link, inner) : link})`;
+}
+
+// Prisma `where` → Drizzle condition. Anything it can't translate throws:
+// silently dropping a filter widens the query (e.g. every team instead of
+// the user's teams).
 function buildCondition(table: any, where: any): any {
-  if (!where || (typeof where === 'object' && Object.keys(where).length === 0)) return undefined;
+  if (!where) return undefined;
   const parts: any[] = [];
   for (const [key, value] of Object.entries(where)) {
-    if (key === 'AND' && Array.isArray(value)) {
-      const sub = value.map(c => buildCondition(table, c)).filter(Boolean);
-      if (sub.length) parts.push(and(...sub));
+    // Prisma treats undefined as "no filter".
+    if (value === undefined) continue;
+    if (key === 'AND' || key === 'OR' || key === 'NOT') {
+      const sub = (Array.isArray(value) ? value : [value]).map(
+        c => buildCondition(table, c) ?? sql`1`,
+      );
+      if (key === 'AND') sub.length && parts.push(and(...sub));
+      else if (key === 'OR') parts.push(sub.length ? or(...sub) : sql`0`);
+      else sub.length && parts.push(sql`not (${or(...sub)})`);
       continue;
     }
-    if (key === 'OR' && Array.isArray(value)) {
-      const sub = value.map(c => buildCondition(table, c)).filter(Boolean);
-      if (sub.length) parts.push(or(...sub));
-      continue;
-    }
-    if (key === 'NOT') {
-      const inner = buildCondition(table, value);
-      if (inner) parts.push(sql`NOT (${inner})`);
+    const relation = RELATIONS.get(table)?.[key];
+    if (relation) {
+      parts.push(relationCondition(table, key, relation, value));
       continue;
     }
     const col = table[key];
-    if (!col) continue;
+    if (!col) {
+      throw new Error(`drizzle-compat: unsupported where key '${key}' on ${getTableName(table)}`);
+    }
     if (value === null) {
       parts.push(isNull(col));
-      continue;
-    }
-    if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
-      const v: any = value;
-      if ('equals' in v) parts.push(eq(col, v.equals));
-      else if ('not' in v)
-        parts.push(v.not === null ? isNotNull(col) : ne(col, v.not));
-      else if ('contains' in v) parts.push(like(col, `%${v.contains}%`));
-      else if ('startsWith' in v) parts.push(like(col, `${v.startsWith}%`));
-      else if ('endsWith' in v) parts.push(like(col, `%${v.endsWith}`));
-      else if ('in' in v) parts.push(inArray(col, v.in));
-      else if ('notIn' in v) parts.push(notInArray(col, v.notIn));
-      else if ('gt' in v) parts.push(gt(col, v.gt));
-      else if ('gte' in v) parts.push(gte(col, v.gte));
-      else if ('lt' in v) parts.push(lt(col, v.lt));
-      else if ('lte' in v) parts.push(lte(col, v.lte));
-      else {
-        // nested object: fall back to JSON eq
-        parts.push(eq(col, v as any));
+    } else if (typeof value === 'object' && !(value instanceof Date)) {
+      for (const [op, arg] of Object.entries(value)) {
+        if (op === 'mode' || arg === undefined) continue;
+        const fn = WHERE_OPS[op];
+        if (!fn) throw new Error(`drizzle-compat: unsupported operator '${op}' on '${key}'`);
+        parts.push(fn(col, arg));
       }
-      continue;
+    } else {
+      parts.push(eq(col, bindable(value)));
     }
-    parts.push(eq(col, value as any));
   }
   if (parts.length === 0) return undefined;
-  if (parts.length === 1) return parts[0];
-  return and(...parts);
+  return parts.length === 1 ? parts[0] : and(...parts);
+}
+
+// findUnique/update/delete must hit a specific row. With undefined filters
+// skipped, `{ id: undefined }` would otherwise match the whole table.
+function requireCondition(cond: any, model: string, op: string) {
+  if (!cond) throw new Error(`drizzle-compat: ${model}.${op}() needs a where condition`);
+  return cond;
 }
 
 function buildOrderBy(table: any, orderBy: any): any[] {
@@ -197,6 +252,26 @@ function prepareWriteData(data: any): any {
   return out;
 }
 
+// Writes return Prisma-style lazy promises: nothing runs until awaited, so
+// transaction() can collect the queries and send them as one db.batch().
+const BATCH = Symbol('drizzle-compat-batch');
+type BatchItem = { query: any; map: (res: any) => any };
+
+function deferred(query: any, map: (res: any) => any) {
+  let p: Promise<any> | undefined;
+  const run = () => (p ??= Promise.resolve(query).then(map));
+  return {
+    [BATCH]: { query, map } as BatchItem,
+    // biome-ignore lint/suspicious/noThenProperty: intentionally thenable, like PrismaPromise
+    then: (ok?: any, err?: any) => run().then(ok, err),
+    catch: (err?: any) => run().catch(err),
+    finally: (fn?: any) => run().finally(fn),
+  };
+}
+
+const first = (rows: any[]) => rows[0];
+const changes = (res: any) => ({ count: res?.meta?.changes ?? 0 });
+
 function modelOps(modelName: string) {
   const table = MODEL_TO_TABLE[modelName];
   if (!table) {
@@ -205,8 +280,8 @@ function modelOps(modelName: string) {
   return {
     async findUnique(args: any) {
       ensureNoInclude(args, modelName, 'findUnique');
-      const cond = buildCondition(table, args?.where);
-      const rows: any[] = await (cond ? db.select().from(table).where(cond) : db.select().from(table)).limit(1);
+      const cond = requireCondition(buildCondition(table, args?.where), modelName, 'findUnique');
+      const rows: any[] = await db.select().from(table).where(cond).limit(1);
       return rows[0] ?? null;
     },
     async findFirst(args: any = {}) {
@@ -230,51 +305,41 @@ function modelOps(modelName: string) {
       if (args?.skip) q = q.offset(args.skip);
       return await q;
     },
-    async create(args: any) {
+    create(args: any) {
       ensureNoInclude(args, modelName, 'create');
-      const [row]: any[] = await db.insert(table).values(prepareWriteData(args.data)).returning();
-      return row;
+      return deferred(db.insert(table).values(prepareWriteData(args.data)).returning(), first);
     },
-    async createMany(args: any) {
+    createMany(args: any) {
       const data = Array.isArray(args.data) ? args.data : [args.data];
-      if (data.length === 0) return { count: 0 };
-      await db.insert(table).values(data.map(prepareWriteData));
-      return { count: data.length };
+      if (data.length === 0) return Promise.resolve({ count: 0 });
+      return deferred(db.insert(table).values(data.map(prepareWriteData)), () => ({
+        count: data.length,
+      }));
     },
-    async update(args: any) {
+    update(args: any) {
       ensureNoInclude(args, modelName, 'update');
-      const cond = buildCondition(table, args?.where);
-      const [row]: any[] = await db
-        .update(table)
-        .set(prepareWriteData(args.data))
-        .where(cond as any)
-        .returning();
-      return row;
+      const cond = requireCondition(buildCondition(table, args?.where), modelName, 'update');
+      return deferred(
+        db.update(table).set(prepareWriteData(args.data)).where(cond).returning(),
+        first,
+      );
     },
-    async updateMany(args: any) {
+    updateMany(args: any) {
       const cond = buildCondition(table, args?.where);
       const q: any = db.update(table).set(prepareWriteData(args.data));
-      if (cond) q.where(cond);
-      const res: any = await q;
-      return { count: res?.meta?.changes ?? 0 };
+      return deferred(cond ? q.where(cond) : q, changes);
     },
-    async delete(args: any) {
+    delete(args: any) {
+      const cond = requireCondition(buildCondition(table, args?.where), modelName, 'delete');
+      return deferred(db.delete(table).where(cond).returning(), first);
+    },
+    deleteMany(args: any = {}) {
       const cond = buildCondition(table, args?.where);
-      const [row]: any[] = await db
-        .delete(table)
-        .where(cond as any)
-        .returning();
-      return row;
-    },
-    async deleteMany(args: any = {}) {
-      const cond = args?.where ? buildCondition(table, args.where) : undefined;
       const q: any = db.delete(table);
-      if (cond) q.where(cond);
-      const res: any = await q;
-      return { count: res?.meta?.changes ?? 0 };
+      return deferred(cond ? q.where(cond) : q, changes);
     },
     async count(args: any = {}) {
-      const cond = args?.where ? buildCondition(table, args.where) : undefined;
+      const cond = buildCondition(table, args?.where);
       let q: any = db.select({ n: sql<number>`count(*)` }).from(table);
       if (cond) q = q.where(cond);
       const rows: any[] = await q;
@@ -282,17 +347,13 @@ function modelOps(modelName: string) {
     },
     async upsert(args: any) {
       ensureNoInclude(args, modelName, 'upsert');
-      const cond = buildCondition(table, args.where);
-      const existing: any[] = await db
-        .select()
-        .from(table)
-        .where(cond as any)
-        .limit(1);
+      const cond = requireCondition(buildCondition(table, args.where), modelName, 'upsert');
+      const existing: any[] = await db.select().from(table).where(cond).limit(1);
       if (existing.length > 0) {
         const [row]: any[] = await db
           .update(table)
           .set(prepareWriteData(args.update))
-          .where(cond as any)
+          .where(cond)
           .returning();
         return row;
       }
@@ -666,21 +727,48 @@ function getSearchParameters(query: string, filters: Record<string, any>[]) {
   return { AND: { OR: params } };
 }
 
-function transaction(input: any, _options?: any): any {
-  // Drizzle's d1 transactions: db.transaction(async (tx) => { ... }).
-  // For callers passing an array of compat-proxy promises (Prisma's batch
-  // style), just await them sequentially since each compat call is already
-  // a self-contained D1 statement.
+async function runBatch(items: BatchItem[]) {
+  if (items.length === 0) return [];
+  const results: any[] = await db.batch(items.map(i => i.query) as any);
+  return results.map((res, n) => items[n].map(res));
+}
+
+const TX_WRITES = new Set(['create', 'createMany', 'update', 'updateMany', 'delete', 'deleteMany']);
+
+// Prisma's $transaction on D1. Both forms become a single db.batch(), which
+// D1 runs atomically. The callback form records writes rather than running
+// them, so it can't read its own writes; reads inside it throw.
+async function transaction(input: any, _options?: any): Promise<any> {
   if (Array.isArray(input)) {
-    return Promise.all(input);
+    return runBatch(
+      input.map(op => {
+        if (!op?.[BATCH]) throw new Error('drizzle-compat: transaction([...]) only accepts writes');
+        return op[BATCH];
+      }),
+    );
   }
-  // For callers passing a function (interactive transaction), run it with
-  // the compat client — drizzle's tx is not used here because the compat
-  // proxy doesn't have a tx-scoped version.
-  if (typeof input === 'function') {
-    return input(client);
-  }
-  return input;
+
+  const recorded: BatchItem[] = [];
+  const tx = new Proxy({} as any, {
+    get: (_, model: string) =>
+      new Proxy({} as any, {
+        get: (_, op: string) => (args: any) => {
+          const item = TX_WRITES.has(op) && client[model][op](args)[BATCH];
+          if (!item) {
+            throw new Error(
+              `drizzle-compat: tx.${model}.${op}() isn't supported in a D1 transaction`,
+            );
+          }
+          recorded.push(item);
+          return Promise.resolve(item);
+        },
+      }),
+  });
+
+  const ret = await input(tx);
+  const results = await runBatch(recorded);
+  const i = recorded.indexOf(ret);
+  return i === -1 ? ret : results[i];
 }
 
 export default {

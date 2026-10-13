@@ -65,7 +65,8 @@
     "d1:import:dry-run": "tsx scripts/migrate-supabase-to-d1.ts --target=local --dry-run",
     "d1:import:local": "tsx scripts/migrate-supabase-to-d1.ts --target=local",
     "d1:import:remote": "tsx scripts/migrate-supabase-to-d1.ts --target=remote",
-    "check-d1-coverage": "node scripts/check-d1-coverage.js"
+    "check-d1-coverage": "node scripts/check-d1-coverage.js",
+    "check-drizzle-d1": "tsx scripts/check-drizzle-d1.ts"
   },
   "cacheDirectories": [
     ".next/cache"

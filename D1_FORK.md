@@ -69,6 +69,18 @@ Covered `where` operators: equality, `null`/not-null, `in`/`notIn`,
 
 Covered query options: `orderBy` (single or array, asc/desc), `take`, `skip`.
 
+Relation filters (`members: { some }`, `website: { ... }`, etc.) compile to
+correlated `EXISTS` for the relations listed in `RELATIONS`. Any `where` key
+or operator the layer can't translate **throws** — silently dropping a filter
+widens the query (it once returned every team to every user). `undefined`
+filters are skipped like Prisma; `findUnique`/`update`/`delete` refuse to run
+without a condition.
+
+`transaction([...])` and `transaction(async tx => ...)` both run as a single
+atomic `db.batch()`. Writes are lazy (like `PrismaPromise`) so the array form
+can collect them; the callback form records writes and can't read inside
+the transaction (reads throw). Covered by `pnpm check-drizzle-d1`.
+
 **Not covered — throws clearly at the callsite:** `include` (relation
 loading). Drizzle requires explicit joins; emulating Prisma's include shape
 generally would be a much larger compat layer. Affected callsites today
@@ -202,6 +214,7 @@ re-run on cutover day for the delta, then flip DNS.
 ## Verification checklist after a merge
 
   - `pnpm check-d1-coverage` passes (no new PG patterns without D1 siblings)
+  - `pnpm check-drizzle-d1` passes (compat layer against an in-memory D1)
   - `pnpm cf:build` completes through all 8 steps
   - `wrangler deploy` reports a worker under 10 MiB compressed
   - `/api/heartbeat` returns 200
