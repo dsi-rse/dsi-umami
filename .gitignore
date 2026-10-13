@@ -57,3 +57,6 @@ yarn-error.log*
 *.env.*
 
 *.dev.yml
+
+# staged by scripts/cf-apply-shims.mjs --gen-client (build artifact)
+prisma/d1-sqlite-compiler.wasm

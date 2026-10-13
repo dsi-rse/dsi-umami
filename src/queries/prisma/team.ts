@@ -1,8 +1,10 @@
 import { Prisma, type Team } from '@/generated/prisma/client';
 import { ROLES } from '@/lib/constants';
 import { uuid } from '@/lib/crypto';
+import { D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { PageResult, QueryFilters } from '@/lib/types';
+import drizzleGetTeams, { drizzleGetTeam } from '@/queries/drizzle/team';
 
 import TeamFindManyArgs = Prisma.TeamFindManyArgs;
 
@@ -16,11 +18,13 @@ export async function getTeam(
 ): Promise<Team> {
   const { includeMembers } = options;
 
-  return findTeam({
-    where: {
-      id: teamId,
-    },
-    ...(includeMembers && { include: { members: true } }),
+  return runQuery({
+    [PRISMA]: () =>
+      findTeam({
+        where: { id: teamId },
+        ...(includeMembers && { include: { members: true } }),
+      }),
+    [D1]: () => drizzleGetTeam(teamId, !!includeMembers),
   });
 }
 
@@ -36,14 +40,11 @@ export async function getTeams(
     ...getSearchParameters(search, [{ name: 'contains' }]),
   };
 
-  return prisma.pagedQuery<TeamFindManyArgs>(
-    'team',
-    {
-      ...criteria,
-      where,
-    },
-    filters,
-  );
+  return runQuery({
+    [PRISMA]: () =>
+      prisma.pagedQuery<TeamFindManyArgs>('team', { ...criteria, where }, filters),
+    [D1]: () => drizzleGetTeams(criteria, where, filters),
+  });
 }
 
 export async function getUserTeams(userId: string, filters: QueryFilters = {}) {

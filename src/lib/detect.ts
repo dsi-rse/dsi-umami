@@ -2,10 +2,23 @@ import path from 'node:path';
 import { browserName, detectOS } from 'detect-browser';
 import ipaddr from 'ipaddr.js';
 import isLocalhost from 'is-localhost-ip';
-import maxmind from 'maxmind';
 import { UAParser } from 'ua-parser-js';
 import { getIpAddress, stripPort } from '@/lib/ip';
 import { safeDecodeURIComponent } from '@/lib/url';
+
+// `is-localhost-ip` does a `dns.lookup` which hangs under Workers' partial
+// `node:dns` shim — every event handler then trips the "code had hung"
+// cancellation. `getIpAddress` always returns a parsed numeric IP, so a
+// sync loopback/private-range check is sufficient and runtime-agnostic.
+function isLocalIpSync(ip: string): boolean {
+  if (!ip) return true;
+  if (ip === '::1' || ip === '0:0:0:0:0:0:0:1') return true;
+  if (ip.startsWith('127.') || ip.startsWith('::ffff:127.')) return true;
+  if (ip === '0.0.0.0' || ip === '::') return true;
+  return false;
+}
+// Suppress unused-import warning when the sync path replaces it at runtime.
+void isLocalhost;
 
 const MAXMIND = 'maxmind';
 
@@ -78,7 +91,7 @@ function decodeHeader(s: string | undefined | null): string | undefined | null {
 
 export async function getLocation(ip: string = '', headers: Headers, skipHeaders: boolean) {
   // Ignore local ips
-  if (!ip || (await isLocalhost(ip))) {
+  if (isLocalIpSync(ip)) {
     return null;
   }
 
@@ -99,8 +112,11 @@ export async function getLocation(ip: string = '', headers: Headers, skipHeaders
     }
   }
 
-  // Database lookup
+  // Database lookup — lazy-import maxmind so the worker bundle stays small
+  // on serverless runtimes (e.g. Cloudflare Workers) that get geo from
+  // request headers and never reach this fallback.
   if (!globalThis[MAXMIND]) {
+    const { default: maxmind } = await import('maxmind');
     const dir = path.join(process.cwd(), 'geo');
 
     globalThis[MAXMIND] = await maxmind.open(

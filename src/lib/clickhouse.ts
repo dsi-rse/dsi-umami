@@ -1,4 +1,4 @@
-import { type ClickHouseClient, createClient } from '@clickhouse/client';
+import type { ClickHouseClient } from '@clickhouse/client';
 import { formatInTimeZone } from 'date-fns-tz';
 import debug from 'debug';
 import { CLICKHOUSE } from '@/lib/db';
@@ -21,7 +21,11 @@ const log = debug('umami:clickhouse');
 let clickhouse: ClickHouseClient;
 const enabled = Boolean(process.env.CLICKHOUSE_URL);
 
-function getClient() {
+async function getClient() {
+  // Lazy-import @clickhouse/client so the worker bundle stays small when
+  // CLICKHOUSE_URL is unset (e.g. on Cloudflare Workers with D1).
+  const { createClient } = await import('@clickhouse/client');
+
   const {
     hostname,
     port,
@@ -306,7 +310,9 @@ async function findFirst(data: any[]) {
 
 async function connect() {
   if (enabled && !clickhouse) {
-    clickhouse = process.env.CLICKHOUSE_URL && (globalThis[CLICKHOUSE] || getClient());
+    if (process.env.CLICKHOUSE_URL) {
+      clickhouse = globalThis[CLICKHOUSE] || (await getClient());
+    }
   }
 
   return clickhouse;

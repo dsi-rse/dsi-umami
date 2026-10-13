@@ -4,7 +4,11 @@ import debug from 'debug';
 import { PrismaClient } from '@/generated/prisma/client';
 import { DEFAULT_PAGE_SIZE, FILTER_COLUMNS, OPERATORS, SESSION_COLUMNS } from './constants';
 import { filtersObjectToArray } from './params';
-import d1Module from './prisma-d1';
+// Phase 7: D1 path moved from Prisma to Drizzle ORM.
+// Workers blocks runtime WASM compilation, which Prisma 7's D1 client requires.
+// prisma-d1.ts is retained for reference / non-Workers SQLite use, but is no
+// longer the default-export for DATABASE_FLAVOR=d1.
+import d1Module from './drizzle-d1';
 import type { Operator, QueryFilters, QueryOptions } from './types';
 
 const log = debug('umami:prisma');

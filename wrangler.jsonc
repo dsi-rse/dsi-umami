@@ -7,6 +7,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "umami",
+	"account_id": "afeb8c48d9711e23a14b014bcfaa01ea",
 	"main": ".open-next/worker.js",
 	"compatibility_date": "2025-12-01",
 	"compatibility_flags": [

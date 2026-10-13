@@ -1,8 +1,10 @@
 import type { Prisma, Website } from '@/generated/prisma/client';
 import { ROLES } from '@/lib/constants';
+import { D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import redis from '@/lib/redis';
 import type { QueryFilters } from '@/lib/types';
+import drizzleGetWebsites from '@/queries/drizzle/website';
 
 export async function findWebsite(criteria: Prisma.WebsiteFindUniqueArgs) {
   return prisma.client.website.findUnique(criteria);
@@ -37,7 +39,10 @@ export async function getWebsites(criteria: Prisma.WebsiteFindManyArgs, filters:
     deletedAt: null,
   };
 
-  const websites = await pagedQuery('website', { ...criteria, where }, filters);
+  const websites = await runQuery({
+    [PRISMA]: () => pagedQuery('website', { ...criteria, where }, filters),
+    [D1]: () => drizzleGetWebsites(criteria, where, filters),
+  });
 
   return attachShareIdToWebsites(websites);
 }

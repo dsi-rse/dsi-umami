@@ -22,7 +22,9 @@ import 'dotenv/config';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
+import { getTableColumns, getTableName, type Table } from 'drizzle-orm';
 import { Client } from 'pg';
+import * as d1Schema from '../src/db/d1/schema';
 
 type Args = {
   target: 'local' | 'remote';
@@ -74,9 +76,34 @@ const TABLES: TableSpec[] = [
 type TableSpec = { name: string; orderBy: string; hasBlob?: boolean };
 
 const BATCH_SIZE = 500;
+// Rows per INSERT statement inside a batch file. D1 enforces a per-statement
+// size cap (SQLITE_TOOBIG); for wide tables (website_event with long URL /
+// referrer / page-title strings) 500-row mega-statements blow past it.
+// Keeping files at ~500 rows total but splitting into ~25-row INSERTs keeps
+// wrangler call count constant while staying well under the limit.
+const STATEMENT_ROWS = 25;
 const OUTPUT_DIR = path.join(process.cwd(), '.migration');
 
 const D1_DATABASE = process.env.D1_DATABASE || 'umami';
+
+// Build a map: pg-table-name → Set<db-column-name> from our Drizzle schema.
+// Used to drop columns that exist in source Supabase but not in D1 (fork-
+// added columns, legacy fields, etc.). Without this, the INSERT fails with
+// "table X has no column named Y".
+const D1_COLUMNS: Record<string, Set<string>> = (() => {
+  const map: Record<string, Set<string>> = {};
+  for (const exp of Object.values(d1Schema)) {
+    if (!exp || typeof exp !== 'object') continue;
+    try {
+      const tableName = getTableName(exp as Table);
+      const cols = getTableColumns(exp as Table);
+      map[tableName] = new Set(Object.values(cols).map((c: any) => c.name));
+    } catch {
+      // not a drizzle table — skip
+    }
+  }
+  return map;
+})();
 
 async function main() {
   const args = parseArgs();
@@ -99,6 +126,20 @@ async function main() {
   }
 
   for (const spec of tables) {
+    // Skip tables that don't exist in this Supabase — older umami forks may
+    // predate later upstream migrations (segment, revenue, link, pixel, board,
+    // share, session_replay*). The D1 schema is fresh and already has all
+    // tables (empty); umami will populate them going forward.
+    const { rows: existsRows } = await pg.query(
+      `SELECT to_regclass($1) IS NOT NULL AS present`,
+      [`public.${spec.name}`],
+    );
+    if (!existsRows[0]?.present) {
+      console.log(`\n== ${spec.name}: skipped (not present in source) ==`);
+      counts[spec.name] = { source: 0, written: 0 };
+      continue;
+    }
+
     const { rows: countRows } = await pg.query(`SELECT count(*)::bigint AS n FROM "${spec.name}"`);
     const total = Number(countRows[0].n);
     counts[spec.name] = { source: total, written: 0 };
@@ -164,6 +205,20 @@ async function getColumns(pg: Client, table: string): Promise<ColumnInfo[]> {
      ORDER BY ordinal_position`,
     [table],
   );
+  const allowed = D1_COLUMNS[table];
+  if (allowed) {
+    const dropped = rows.filter(r => !allowed.has(r.column_name)).map(r => r.column_name);
+    if (dropped.length > 0) {
+      console.log(`    (skipping cols not in D1: ${dropped.join(', ')})`);
+    }
+    return rows
+      .filter(r => allowed.has(r.column_name))
+      .map(r => ({
+        name: r.column_name,
+        type: r.data_type,
+        nullable: r.is_nullable === 'YES',
+      }));
+  }
   return rows.map(r => ({
     name: r.column_name,
     type: r.data_type,
@@ -215,12 +270,20 @@ class BatchWriter {
   add(rows: Record<string, any>[]) {
     if (rows.length === 0) return;
     const colList = this.columns.map(c => quoteIdent(c.name)).join(', ');
-    const values = rows.map(r => {
-      const vals = this.columns.map(c => sqlLit(r[c.name])).join(', ');
-      return `(${vals})`;
-    });
-    const stmt = `INSERT OR REPLACE INTO ${quoteIdent(this.table)} (${colList}) VALUES\n${values.join(',\n')};\n`;
-    this.buf.push(stmt);
+    const tableIdent = quoteIdent(this.table);
+
+    // Split the batch into smaller INSERT statements so a single statement
+    // never trips SQLITE_TOOBIG. One file still contains all rows from this
+    // FETCH (so the wrangler call count is unchanged).
+    for (let i = 0; i < rows.length; i += STATEMENT_ROWS) {
+      const chunk = rows.slice(i, i + STATEMENT_ROWS);
+      const values = chunk.map(r => {
+        const vals = this.columns.map(c => sqlLit(r[c.name])).join(', ');
+        return `(${vals})`;
+      });
+      const stmt = `INSERT OR REPLACE INTO ${tableIdent} (${colList}) VALUES\n${values.join(',\n')};\n`;
+      this.buf.push(stmt);
+    }
 
     // ~500 rows per file. Wrangler accepts files up to its statement size cap.
     if (this.buf.length >= 1) {
@@ -264,15 +327,50 @@ function sqlLit(v: any): string {
 function applyBatch(file: string, target: 'local' | 'remote') {
   const flag = target === 'local' ? '--local' : '--remote';
   process.stdout.write(`  applying ${path.basename(file)} ...`);
-  try {
-    execFileSync('wrangler', ['d1', 'execute', D1_DATABASE, flag, `--file=${file}`], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    process.stdout.write(' ok\n');
-  } catch (err: any) {
-    process.stdout.write(' FAIL\n');
-    console.error(err.stderr?.toString() || err.message);
-    throw err;
+
+  // Retry transient Cloudflare API errors. Wrangler hits the D1 `/import`
+  // endpoint for large SQL files; long unbroken runs sometimes see OAuth /
+  // rate-limit blips ("Authentication error [code: 10000]") that resolve on
+  // a quick retry. Up to 4 attempts with exponential backoff.
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      execFileSync('wrangler', ['d1', 'execute', D1_DATABASE, flag, `--file=${file}`], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      process.stdout.write(attempt === 1 ? ' ok\n' : ` ok (after ${attempt} attempts)\n`);
+      return;
+    } catch (err: any) {
+      const isLast = attempt === MAX_ATTEMPTS;
+      const stderr = err.stderr?.toString() || '';
+      const looksTransient =
+        stderr.includes('Authentication error') ||
+        stderr.includes('code: 10000') ||
+        stderr.includes('rate limit') ||
+        stderr.includes('503') ||
+        stderr.includes('504') ||
+        stderr.includes('ECONNRESET') ||
+        stderr.includes('ETIMEDOUT');
+      if (isLast || !looksTransient) {
+        process.stdout.write(' FAIL\n');
+        console.error(stderr || err.message);
+        if (looksTransient && isLast) {
+          console.error(
+            '\nThis looks like a Cloudflare auth/rate-limit issue. Try:\n' +
+              '  1. `wrangler login` to refresh OAuth credentials\n' +
+              '  2. Re-run the same command — already-applied batches re-apply harmlessly (INSERT OR REPLACE).',
+          );
+        }
+        throw err;
+      }
+      const delaySec = 5 * 2 ** (attempt - 1); // 5, 10, 20 seconds
+      process.stdout.write(` retry in ${delaySec}s (attempt ${attempt}/${MAX_ATTEMPTS - 1}) ...`);
+      try {
+        execFileSync('sleep', [String(delaySec)], { stdio: 'ignore' });
+      } catch {
+        // ignore sleep errors; immediately retry
+      }
+    }
   }
 }
 

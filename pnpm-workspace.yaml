@@ -1,14 +1,14 @@
 packages:
   - '**'
 allowBuilds:
-  '@parcel/watcher': set this to true or false
-  '@prisma/engines': set this to true or false
-  '@swc/core': set this to true or false
-  cypress: set this to true or false
-  esbuild: set this to true or false
-  prisma: set this to true or false
-  sharp: set this to true or false
-  workerd: set this to true or false
+  '@parcel/watcher': true
+  '@prisma/engines': true
+  '@swc/core': true
+  cypress: true
+  esbuild: true
+  prisma: true
+  sharp: true
+  workerd: true
 ignoredBuiltDependencies:
   - cypress
   - esbuild
@@ -18,3 +18,5 @@ onlyBuiltDependencies:
   - '@prisma/engines'
   - prisma
   - workerd
+  - pg-cloudflare
+  - esbuild
