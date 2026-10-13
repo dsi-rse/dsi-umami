@@ -541,15 +541,23 @@ const client = new Proxy({} as any, {
 // 12 src/queries/sql/*.ts dispatch points call these via `prisma.getDateSQL`
 // etc. — keep the names and signatures stable.
 
+// Timestamps are stored as ISO strings ('YYYY-MM-DDTHH:MM:SS.sssZ'), and range
+// filters compare them as text, so date math has to produce the same format.
+const SQLITE_ISO_FORMAT = '%Y-%m-%dT%H:%M:%fZ';
+
 function getAddIntervalQuery(field: string, interval: string): string {
-  return `datetime(${field}, '${interval}')`;
+  return `strftime('${SQLITE_ISO_FORMAT}', ${field}, '${interval}')`;
 }
 
+// PG: field1::date - field2::date (whole calendar days).
 function getDayDiffQuery(field1: string, field2: string): string {
-  return `CAST(julianday(${field1}) - julianday(${field2}) AS INTEGER)`;
+  return `CAST(julianday(${field1}, 'start of day') - julianday(${field2}, 'start of day') AS INTEGER)`;
 }
 
 function getCastColumnQuery(field: string, type: string): string {
+  const t = type.toLowerCase();
+  if (t === 'date') return `date(${field})`;
+  if (t === 'timestamp' || t === 'timestamptz') return `strftime('${SQLITE_ISO_FORMAT}', ${field})`;
   const sqliteType =
     {
       uuid: 'TEXT',
@@ -562,13 +570,12 @@ function getCastColumnQuery(field: string, type: string): string {
       double: 'REAL',
       numeric: 'REAL',
       decimal: 'REAL',
-      date: 'TEXT',
-      timestamp: 'TEXT',
-      timestamptz: 'TEXT',
-    }[type.toLowerCase()] ?? type.toUpperCase();
+    }[t] ?? type.toUpperCase();
   return `CAST(${field} AS ${sqliteType})`;
 }
 
+// Same output strings as PG's DATE_FORMATS / DATE_FORMATS_UTC (src/lib/prisma.ts):
+// local wall time without a zone for a named timezone, ISO with Z for 'utc'.
 const SQLITE_DATE_FORMATS: Record<string, string> = {
   minute: '%Y-%m-%d %H:%M:00',
   hour: '%Y-%m-%d %H:00:00',
@@ -577,20 +584,115 @@ const SQLITE_DATE_FORMATS: Record<string, string> = {
   year: '%Y-01-01 00:00:00',
 };
 
-function getDateSQL(field: string, unit: string, _timezone?: string): string {
-  return `strftime('${SQLITE_DATE_FORMATS[unit]}', ${field})`;
+const SQLITE_DATE_FORMATS_UTC: Record<string, string> = {
+  minute: '%Y-%m-%dT%H:%M:00Z',
+  hour: '%Y-%m-%dT%H:00:00Z',
+  day: '%Y-%m-%dT00:00:00Z',
+  month: '%Y-%m-01T00:00:00Z',
+  year: '%Y-01-01T00:00:00Z',
+};
+
+// SQLite has no IANA zone support, so `AT TIME ZONE` becomes a strftime
+// modifier picked from the zone's UTC-offset history, computed with Intl.
+// Covers 2015-01-01 through Jan 1 two years out; earlier timestamps use the
+// offset in effect at the start of 2015. The timezone string never reaches
+// the SQL: only computed offsets and ISO instants do, and Intl throws on an
+// unknown zone.
+const TZ_RANGE_START = Date.UTC(2015, 0, 1);
+const tzTransitionCache = new Map<string, { offsets: number[]; instants: string[] }>();
+
+function getTimezoneTransitions(timezone: string) {
+  let cached = tzTransitionCache.get(timezone);
+  if (cached) return cached;
+
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+  });
+  // Offset in minutes at a minute-aligned instant.
+  const offsetAt = (t: number) => {
+    const p: Record<string, number> = {};
+    for (const { type, value } of dtf.formatToParts(t)) p[type] = +value;
+    return (Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute) - t) / 60000;
+  };
+
+  // Weekly probes: no zone has two transitions closer than 28 days since 2015
+  // (checked against every Intl zone), so a week can't hide a round trip.
+  const STEP = 7 * 86400000;
+  const MINUTE = 60000;
+  const end = Date.UTC(new Date().getUTCFullYear() + 2, 0, 1);
+  // offsets[i] applies from instants[i - 1] (inclusive) up to instants[i].
+  const offsets = [offsetAt(TZ_RANGE_START)];
+  const instants: string[] = [];
+
+  for (let t = TZ_RANGE_START + STEP; t <= end; t += STEP) {
+    const offset = offsetAt(t);
+    if (offset !== offsets[offsets.length - 1]) {
+      // Binary search the first minute in (t - STEP, t] with the new offset.
+      let lo = t - STEP;
+      let hi = t;
+      while (hi - lo > MINUTE) {
+        const mid = lo + Math.floor((hi - lo) / MINUTE / 2) * MINUTE;
+        if (offsetAt(mid) === offset) hi = mid;
+        else lo = mid;
+      }
+      instants.push(new Date(hi).toISOString());
+      offsets.push(offset);
+    }
+  }
+
+  cached = { offsets, instants };
+  tzTransitionCache.set(timezone, cached);
+  return cached;
 }
 
-function getDateWeeklySQL(field: string, _timezone?: string) {
-  return `(strftime('%w', ${field}) || ':' || strftime('%H', ${field}))`;
+const toModifier = (minutes: number) => `'${minutes >= 0 ? '+' : ''}${minutes} minutes'`;
+
+// Returns `, <modifier>` to append to strftime() args, or '' for UTC.
+function getTimezoneModifier(field: string, timezone?: string): string {
+  if (!timezone || timezone.toLowerCase() === 'utc') return '';
+
+  const { offsets, instants } = getTimezoneTransitions(timezone);
+
+  if (instants.length === 0) {
+    return offsets[0] === 0 ? '' : `, ${toModifier(offsets[0])}`;
+  }
+
+  // Newest transition first: most queried rows are recent.
+  const whens = instants
+    .map((instant, i) => `WHEN ${field} >= '${instant}' THEN ${toModifier(offsets[i + 1])}`)
+    .reverse();
+
+  return `, CASE ${whens.join(' ')} ELSE ${toModifier(offsets[0])} END`;
+}
+
+function getDateSQL(field: string, unit: string, timezone?: string): string {
+  if (timezone && timezone !== 'utc') {
+    return `strftime('${SQLITE_DATE_FORMATS[unit]}', ${field}${getTimezoneModifier(field, timezone)})`;
+  }
+
+  return `strftime('${SQLITE_DATE_FORMATS_UTC[unit]}', ${field})`;
+}
+
+// PG: concat(extract(dow ...), ':', to_char(..., 'HH24')), e.g. '0:09'.
+function getDateWeeklySQL(field: string, timezone?: string) {
+  return `strftime('%w:%H', ${field}${getTimezoneModifier(field, timezone)})`;
 }
 
 export function getTimestampSQL(field: string) {
   return `unixepoch(${field})`;
 }
 
+// PG: floor(extract(epoch from (field2 - field1))). Diff in integer
+// milliseconds so sub-second parts count and float error can't drop a second.
 function getTimestampDiffSQL(field1: string, field2: string): string {
-  return `(unixepoch(${field2}) - unixepoch(${field1}))`;
+  const ms = (field: string) => `CAST(round(unixepoch(${field}, 'subsec') * 1000) AS INTEGER)`;
+  return `((${ms(field2)} - ${ms(field1)}) / 1000)`;
 }
 
 function getSearchSQL(column: string, param: string = 'search'): string {
@@ -801,11 +903,18 @@ async function rawQuery(sqlText: string, data: Record<string, any>, name?: strin
     log('NAME:\n', name);
   }
 
+  // One numbered parameter (?1, ?2, ...) per distinct name: D1 caps a
+  // statement at 100 bound parameters, and queries repeat names freely.
   const params: any[] = [];
+  const indexes = new Map<string, number>();
   const query = sqlText?.replaceAll(/\{\{\s*(\w+)(::\w+)?\s*}}/g, (...args) => {
     const [, key] = args;
-    params.push(bindable(data[key]));
-    return '?';
+    let index = indexes.get(key);
+    if (index === undefined) {
+      index = params.push(bindable(data[key]));
+      indexes.set(key, index);
+    }
+    return `?${index}`;
   });
 
   // Use the raw D1 binding directly — Drizzle's sql.raw doesn't support

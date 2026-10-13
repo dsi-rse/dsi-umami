@@ -1,8 +1,9 @@
 import clickhouse from '@/lib/clickhouse';
 import { SESSION_COLUMNS } from '@/lib/constants';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetPerformanceMetrics from '@/queries/sqlite/reports/getPerformanceMetrics';
 import type { PerformanceParameters } from './getPerformance';
 
 export interface PerformanceMetricsData {
@@ -25,6 +26,7 @@ export async function getPerformanceMetrics(
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetPerformanceMetrics(...args),
   });
 }
 

@@ -1,5 +1,6 @@
 import { FILTER_COLUMNS, OPERATORS } from '@/lib/constants';
 import { safeDecodeURIComponent } from '@/lib/url';
+import { useConfig } from './useConfig';
 import { useFields } from './useFields';
 import { useMessages } from './useMessages';
 import { useNavigation } from './useNavigation';
@@ -10,6 +11,7 @@ export function useFilters() {
   const { query } = useNavigation();
   const { fields } = useFields();
   const operatorLabels = useOperatorLabels();
+  const config = useConfig();
 
   const operators = [
     { name: 'eq', type: 'string', label: t(labels.is) },
@@ -31,7 +33,7 @@ export function useFilters() {
     { name: 'bf', type: 'date', label: t(labels.before) },
     { name: 'af', type: 'date', label: t(labels.after) },
     { name: 'eq', type: 'uuid', label: t(labels.is) },
-  ];
+  ].filter(({ name }) => !config?.regexFiltersDisabled || (name !== 're' && name !== 'nre'));
 
   const typeFilters = {
     string: [

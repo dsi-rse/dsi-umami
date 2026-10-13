@@ -1,7 +1,8 @@
 import { subMinutes } from 'date-fns';
 import clickhouse from '@/lib/clickhouse';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
+import sqliteGetActiveVisitors from '@/queries/sqlite/getActiveVisitors';
 
 const FUNCTION_NAME = 'getActiveVisitors';
 
@@ -9,6 +10,7 @@ export async function getActiveVisitors(...args: [websiteId: string]) {
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetActiveVisitors(...args),
   });
 }
 

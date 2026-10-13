@@ -76,7 +76,6 @@ export async function sqliteGetFunnel(
     const result = steps.reduce(
       (pv, cv, i) => {
         const levelNumber = i + 1;
-        const startSum = i > 0 ? 'union ' : '';
         const isURL = cv.type === 'path';
         const column = isURL ? 'url_path' : 'event_name';
 
@@ -112,15 +111,17 @@ export async function sqliteGetFunnel(
               ${existsClause}
           )`;
         } else {
-          // getAddIntervalQuery in prisma-d1 emits SQLite datetime() with a
-          // modifier string like '+10 minute'.
+          // getAddIntervalQuery emits strftime(ISO, field, '+N minute').
+          // CROSS JOIN pins level{i} as the outer loop and INDEXED BY makes
+          // each probe a (website_id, session_id, created_at) range seek;
+          // left alone SQLite scans website_event's whole history instead.
           pv.levelQuery += `
           , level${levelNumber} AS (
             select distinct we.session_id, we.created_at
             from level${i} l
-            join website_event we
-                on l.session_id = we.session_id
+            cross join website_event we indexed by website_event_website_id_session_id_created_at_idx
             where we.website_id = {{websiteId}}
+                and we.session_id = l.session_id
                 and we.created_at between l.created_at and ${getAddIntervalQuery(
                   `l.created_at`,
                   `+${window} minute`,
@@ -131,7 +132,9 @@ export async function sqliteGetFunnel(
           )`;
         }
 
-        pv.sumQuery += `\n${startSum}select ${levelNumber} as level, count(distinct(session_id)) as count from level${levelNumber}`;
+        // One row, one scalar subquery per level: D1 allows at most 5 terms
+        // in a compound SELECT, so the PG `union` breaks at 6+ steps.
+        pv.sumQuery += `${i > 0 ? ',' : ''}\n(select count(distinct(session_id)) from level${levelNumber}) as count${levelNumber}`;
         pv.params[i] = paramValue;
 
         return pv;
@@ -151,8 +154,7 @@ export async function sqliteGetFunnel(
     `
     ${levelOneQuery}
     ${levelQuery}
-    ${sumQuery}
-    ORDER BY level;
+    select ${sumQuery};
     `,
     {
       ...params,
@@ -161,7 +163,10 @@ export async function sqliteGetFunnel(
   ).then(formatResults(steps));
 }
 
-const formatResults = (steps: Array<FunnelStep>) => (results: any) => {
+const formatResults = (steps: Array<FunnelStep>) => (rows: any) => {
+  // Reshape the single row into the PG path's per-level rows.
+  const results = steps.map((_, i) => ({ count: rows?.[0]?.[`count${i + 1}`] }));
+
   return steps.map((step: FunnelStep, i: number) => {
     const visitors = Number(results[i]?.count) || 0;
     const previous = Number(results[i - 1]?.count) || 0;

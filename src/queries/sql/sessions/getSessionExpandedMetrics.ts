@@ -1,8 +1,9 @@
 import clickhouse from '@/lib/clickhouse';
 import { FILTER_COLUMNS, SESSION_COLUMNS } from '@/lib/constants';
-import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
+import sqliteGetSessionExpandedMetrics from '@/queries/sqlite/sessions/getSessionExpandedMetrics';
 
 const FUNCTION_NAME = 'getSessionExpandedMetrics';
 
@@ -27,6 +28,7 @@ export async function getSessionExpandedMetrics(
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    [D1]: () => sqliteGetSessionExpandedMetrics(...args),
   });
 }
 

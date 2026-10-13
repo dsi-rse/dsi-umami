@@ -54,7 +54,7 @@ export async function sqliteGetSessionReplays(
       count(sr.replay_id) as "chunkCount",
       min(sr.started_at) as "startedAt",
       max(sr.ended_at) as "endedAt",
-      sum((unixepoch(sr.ended_at) - unixepoch(sr.started_at)) * 1000) as "duration",
+      cast(sum(round(unixepoch(sr.ended_at, 'subsec') * 1000) - round(unixepoch(sr.started_at, 'subsec') * 1000)) as integer) as "duration",
       max(sr.created_at) as "createdAt"
     from session_replay sr
     join session on session.session_id = sr.session_id

@@ -4,10 +4,12 @@
  * patterns also has a matching D1/SQLite sibling under src/queries/sqlite/
  * and wires it via a `[D1]:` key on the runQuery dispatch.
  *
- * Best-effort static check, run during CI / pre-merge. New upstream queries
- * that introduce PG-only syntax will surface here.
+ * Best-effort static check. The fork has no CI, so run it by hand after
+ * merging upstream: new upstream queries that introduce PG-only syntax will
+ * surface here. It only reads source text; src/queries/sqlite/d1-smoke.test.ts
+ * actually runs the queries against SQLite.
  *
- * Run: node scripts/check-d1-coverage.js
+ * Run: pnpm check-d1-coverage (or node scripts/check-d1-coverage.js)
  */
 
 import { readFileSync, statSync } from 'node:fs';
@@ -25,15 +27,26 @@ const SQLITE_DIR = path.join(ROOT, 'src/queries/sqlite');
 // literals or comments are not filtered out — false positives are OK; the goal
 // is to flag review opportunities.
 const PG_PATTERNS = [
-  { name: 'extract(epoch from)', re: /extract\s*\(\s*epoch\s+from/i },
+  { name: 'extract(<field> from)', re: /\bextract\s*\(\s*\w+\s+from\b/i },
   { name: 'date_trunc(', re: /\bdate_trunc\s*\(/i },
+  { name: 'at time zone', re: /\bat\s+time\s+zone\b/i },
+  { name: 'interval', re: /\binterval\b/i },
   { name: 'ilike', re: /\bilike\b/i },
   { name: 'regex ~* / !~*', re: /[~!]~\*/ },
   { name: 'regexp_replace(', re: /\bregexp_replace\s*\(/i },
   { name: 'to_char(', re: /\bto_char\s*\(/i },
   { name: 'jsonb / json ->>', re: /->>|::jsonb/ },
   { name: '::uuid[] or ::int[]', re: /::(uuid|int|text|bigint)\[\]/ },
+  // rawQuery strips the type from {{name::type}} placeholders; any other
+  // `::type` is a PG cast.
+  { name: '::type cast', re: /(?<!\{\{\s*\w+)::\w/ },
   { name: 'distinct on (', re: /\bdistinct\s+on\s*\(/i },
+  { name: 'percentile_cont / within group', re: /\bpercentile_(cont|disc)\b|\bwithin\s+group\b/i },
+  { name: 'left(', re: /\bleft\s*\(/i },
+  { name: 'ANY( / op ALL(', re: /\bany\s*\(|[=<>]\s*all\s*\(/i },
+  { name: 'filter (where', re: /\bfilter\s*\(\s*where\b/i },
+  { name: 'string_agg( / array_agg(', re: /\b(string_agg|array_agg)\s*\(/i },
+  { name: 'greatest( / least(', re: /\b(greatest|least)\s*\(/i },
 ];
 
 const PG_BRANCH_HEAD = /async\s+function\s+relationalQuery|\[PRISMA\]\s*:/;
