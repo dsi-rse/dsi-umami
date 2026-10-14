@@ -1,5 +1,5 @@
 import prisma from '@/lib/prisma';
-import type { QueryFilters } from '@/lib/types';
+import type { PageResult, QueryFilters, SessionReplaySummary } from '@/lib/types';
 
 const FUNCTION_NAME = 'getSessionReplays';
 
@@ -7,10 +7,11 @@ export async function sqliteGetSessionReplays(
   websiteId: string,
   filters: QueryFilters,
   sessionId?: string,
-) {
+): Promise<PageResult<SessionReplaySummary[]>> {
   const { pagedRawQuery, parseFilters } = prisma;
-  const { search } = filters;
-  const { filterQuery, cohortQuery, queryParams } = parseFilters({
+  const { search, minDuration } = filters;
+  const minDurationMs = minDuration && minDuration > 0 ? minDuration * 1000 : undefined;
+  const { filterQuery, cohortQuery, queryParams, joinSessionQuery } = parseFilters({
     ...filters,
     websiteId,
     search: search ? `%${search}%` : undefined,
@@ -20,6 +21,7 @@ export async function sqliteGetSessionReplays(
     filterQuery || cohortQuery
       ? `join (select distinct website_event.website_id, website_event.session_id, website_event.visit_id
                from website_event
+               ${joinSessionQuery}
                ${cohortQuery}
                where website_event.website_id = {{websiteId}}
                   and website_event.created_at between {{startDate}} and {{endDate}}
@@ -39,6 +41,11 @@ export async function sqliteGetSessionReplays(
            or session.device LIKE {{search}})`
     : '';
 
+  // PG: sum(extract(epoch from sr.ended_at - sr.started_at) * 1000).
+  const durationMs = `sum(round(unixepoch(sr.ended_at, 'subsec') * 1000) - round(unixepoch(sr.started_at, 'subsec') * 1000))`;
+
+  const havingQuery = minDurationMs ? `having ${durationMs} >= {{minDurationMs}}` : '';
+
   return pagedRawQuery(
     `
     select
@@ -54,7 +61,7 @@ export async function sqliteGetSessionReplays(
       count(sr.replay_id) as "chunkCount",
       min(sr.started_at) as "startedAt",
       max(sr.ended_at) as "endedAt",
-      cast(sum(round(unixepoch(sr.ended_at, 'subsec') * 1000) - round(unixepoch(sr.started_at, 'subsec') * 1000)) as integer) as "duration",
+      cast(${durationMs} as integer) as "duration",
       max(sr.created_at) as "createdAt"
     from session_replay sr
     join session on session.session_id = sr.session_id
@@ -72,9 +79,10 @@ export async function sqliteGetSessionReplays(
       session.device,
       session.country,
       session.city
+    ${havingQuery}
     order by max(sr.created_at) desc
     `,
-    { ...queryParams, sessionId },
+    { ...queryParams, sessionId, minDurationMs },
     filters,
     FUNCTION_NAME,
   );

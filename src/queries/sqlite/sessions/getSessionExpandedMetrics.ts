@@ -1,4 +1,4 @@
-import { FILTER_COLUMNS, SESSION_COLUMNS } from '@/lib/constants';
+import { EVENT_TYPE, FILTER_COLUMNS, SESSION_COLUMNS } from '@/lib/constants';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
 import type {
@@ -27,11 +27,27 @@ export async function sqliteGetSessionExpandedMetrics(
         joinSession: SESSION_COLUMNS.includes(type),
       },
     );
+  const needsBounceEvents = filters.excludeBounce !== true;
   const includeCountry = column === 'city' || column === 'region';
 
   if (type === 'language') {
     column = `lower(substr(${type}, 1, 2))`;
   }
+  const bounceQuery = needsBounceEvents
+    ? `sum(case when t.c = 1 and coalesce(e.has_custom_event, 0) = 0 then 1 else 0 end) as "bounces",`
+    : '0 as "bounces",';
+  const visitEventsJoin = needsBounceEvents
+    ? `left join (
+      select session_id, visit_id, 1 as "has_custom_event"
+      from website_event
+      where website_id = {{websiteId}}
+        and created_at between {{startDate}} and {{endDate}}
+        and event_type = ${EVENT_TYPE.customEvent}
+      group by 1, 2
+    ) as e
+      on e.session_id = t.session_id
+      and e.visit_id = t.visit_id`
+    : '';
 
   return rawQuery(
     `
@@ -41,7 +57,7 @@ export async function sqliteGetSessionExpandedMetrics(
       sum(t.c) as "pageviews",
       count(distinct t.session_id) as "visitors",
       count(distinct t.visit_id) as "visits",
-      sum(case when t.c = 1 then 1 else 0 end) as "bounces",
+      ${bounceQuery}
       sum(${getTimestampDiffSQL('t.min_time', 't.max_time')}) as "totaltime"
     from (
       select
@@ -63,6 +79,7 @@ export async function sqliteGetSessionExpandedMetrics(
       group by name, website_event.session_id, website_event.visit_id
       ${includeCountry ? ', country' : ''}
     ) as t
+    ${visitEventsJoin}
     where name != ''
     group by name
     ${includeCountry ? ', country' : ''}

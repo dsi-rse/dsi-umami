@@ -157,16 +157,30 @@ try {
   const report = await client.report.findUnique({ where: { id: 'r-w1' } });
   assert.deepEqual(report.parameters, { steps: [{ type: 'path', value: '/' }] });
 
-  // Defaults are ISO, matching what range filters compare against.
-  assert.match(report.createdAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  // Timestamps read back as Date, as from Prisma; defaults are stored as ISO
+  // text, matching what range filters compare against.
+  assert.ok(report.createdAt instanceof Date);
+  const storedAt = await db
+    .prepare(`select created_at from report where report_id = 'r-w1'`)
+    .first<string>('created_at');
+  assert.match(storedAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  assert.equal(report.createdAt.toISOString(), storedAt);
+  // SQLite's CURRENT_TIMESTAMP form reads as UTC.
+  await db
+    .prepare(`update report set updated_at = '2026-01-02 03:04:05' where report_id = 'r-w1'`)
+    .run();
+  assert.equal(
+    (await client.report.findUnique({ where: { id: 'r-w1' } })).updatedAt.toISOString(),
+    '2026-01-02T03:04:05.000Z',
+  );
 
   // undefined is "leave alone", as in Prisma: partial updates keep other columns.
   const toggled = await client.website.update({
     where: { id: 'w1' },
-    data: { name: undefined, domain: undefined, replayEnabled: true },
+    data: { name: undefined, domain: undefined, recorderEnabled: true },
   });
   assert.equal(toggled.name, 'A');
-  assert.equal(toggled.replayEnabled, true);
+  assert.equal(toggled.recorderEnabled, true);
 
   // select / omit project columns, so excluded ones (password) never leave.
   const projected = await client.user.findUnique({
@@ -223,6 +237,48 @@ try {
   assert.deepEqual(await saved('v1'), { id: 'rs1' });
   assert.equal(await saved('v2'), null);
 
+  // upsert on single and compound unique keys; cuid ids and @updatedAt are
+  // filled in by the schema, and `{ increment }` updates in place.
+  const otp = { userId_otp: { userId: 'u1', otp: '123456' } };
+  const firstUse = await client.twoFactorOtpUsed.upsert({
+    where: otp,
+    update: { expiresAt: new Date(0) },
+    create: { userId: 'u1', otp: '123456', expiresAt: new Date(1000) },
+  });
+  assert.ok(firstUse.id && firstUse.expiresAt.getTime() === 1000);
+  const reused = await client.twoFactorOtpUsed.upsert({
+    where: otp,
+    update: { expiresAt: new Date(2000) },
+    create: { userId: 'u1', otp: '123456', expiresAt: new Date(3000) },
+  });
+  assert.equal(reused.id, firstUse.id);
+  assert.equal(
+    (await client.twoFactorOtpUsed.findUnique({ where: otp })).expiresAt.getTime(),
+    2000,
+  );
+  await client.twoFactorOtpUsed.delete({ where: otp });
+  assert.equal(await client.twoFactorOtpUsed.count(), 0);
+  const attempt = () =>
+    client.twoFactorRateLimit.upsert({
+      where: { userId: 'u1' },
+      update: { attempts: { increment: 1 } },
+      create: { userId: 'u1', attempts: 1 },
+    });
+  const created = await attempt();
+  assert.ok(created.updatedAt instanceof Date);
+  assert.equal(created.attempts, 1);
+  assert.equal((await attempt()).attempts, 2);
+  for (const value of ['true', 'false']) {
+    await client.appSetting.upsert({
+      where: { key: 'twoFactorRequiredGlobal' },
+      update: { value },
+      create: { key: 'twoFactorRequiredGlobal', value },
+    });
+  }
+  assert.deepEqual(await client.appSetting.findMany(), [
+    { key: 'twoFactorRequiredGlobal', value: 'false' },
+  ]);
+
   // createMany splits rows so no statement passes D1's 100 bound params.
   const event = { websiteId: 'w1', websiteEventId: 'e1', dataType: 1, createdAt: new Date() };
   const rows = Array.from({ length: 30 }, (_, i) => ({ ...event, id: `d${i}`, dataKey: `k${i}` }));
@@ -272,8 +328,13 @@ try {
   assert.deepEqual(await transaction([client.team.deleteMany({ where: { id: 't2' } })]), [
     { count: 1 },
   ]);
+  // Reads run before the first recorded write, not after it.
+  assert.deepEqual(ids(await transaction(async tx => tx.team.findMany({}))), ['t1']);
   await assert.rejects(
-    transaction(async tx => tx.team.findMany({})),
+    transaction(async tx => {
+      await tx.team.deleteMany({ where: { id: 'nope' } });
+      return tx.team.findMany({});
+    }),
     /findMany/,
   );
 
@@ -330,8 +391,9 @@ try {
 
   assert.deepEqual(ids((await q.getUserWebsites('u1')).data), ['w1']);
   assert.deepEqual((await q.getUserWebsites('u1')).data[0].user, { username: 'ann', id: 'u1' });
-  assert.deepEqual(ids((await q.getAllUserWebsitesIncludingTeamOwner('u2')).data), ['w2', 'w3']);
-  assert.deepEqual(ids((await q.getAllUserWebsitesIncludingTeamOwner('u1')).data), ['w1']);
+  assert.deepEqual(ids((await q.getAllUserWebsitesIncludingTeamAccess('u2')).data), ['w2', 'w3']);
+  assert.deepEqual(ids((await q.getAllUserWebsitesIncludingTeamAccess('u1')).data), ['w1']);
+  assert.equal(await q.getUserOwnedTeamCount('u2'), 1);
   const teamSites = await q.getTeamWebsites('t2', {});
   assert.deepEqual(teamSites.data[0].createUser, { id: 'u2', username: 'bob' });
 
@@ -381,7 +443,74 @@ try {
     ['u2'],
   );
 
-  // deleteWebsite purges analytics rows in chunks before the atomic batch.
+  // API keys: select on create; lastUsedAt is a Date (auth calls .getTime());
+  // delete is scoped to the owner.
+  const key = await q.createApiKey({
+    id: 'k1',
+    userId: 'u1',
+    name: 'ci',
+    keyHash: 'h1',
+    keyPrefix: 'um_',
+  });
+  assert.deepEqual(Object.keys(key).sort(), ['createdAt', 'id', 'keyPrefix', 'name']);
+  await q.updateApiKeyLastUsed('k1');
+  assert.ok((await q.getApiKeyByHash('h1')).lastUsedAt.getTime() <= Date.now());
+  assert.deepEqual(ids(await q.getUserApiKeys('u1')), ['k1']);
+  assert.equal(await q.deleteApiKey('k1', 'u2'), 0);
+  assert.equal(await q.deleteApiKey('k1', 'u1'), 1);
+
+  // Annotations: date range and search through pagedQuery; @updatedAt is set.
+  await transaction([
+    client.annotation.create({
+      data: { id: 'a1', websiteId: 'w1', date: new Date('2026-03-01T00:00:00Z'), note: 'launch' },
+    }),
+    client.annotation.create({
+      data: { id: 'a2', websiteId: 'w1', date: new Date('2026-05-01T00:00:00Z'), note: 'other' },
+    }),
+  ]);
+  const march = { startDate: new Date('2026-03-01T00:00:00Z'), endDate: new Date('2026-03-31') };
+  assert.deepEqual(ids((await q.getWebsiteAnnotations('w1', march)).data), ['a1']);
+  assert.deepEqual(ids((await q.getWebsiteAnnotations('w1', { search: 'oth' })).data), ['a2']);
+  const a1 = await q.getWebsiteAnnotation('w1', 'a1');
+  assert.ok(a1.date instanceof Date && a1.allDay === true && a1.updatedAt instanceof Date);
+  assert.equal((await q.updateAnnotation('a1', { note: 'launch!' })).note, 'launch!');
+
+  // 2FA lockout and OTP replay compare stored timestamps with `new Date()`.
+  const rateLimit = await import('../src/lib/two-factor/rate-limit');
+  const replay = await import('../src/lib/two-factor/replay-prevention');
+  for (let i = 0; i < 4; i++) assert.deepEqual(await rateLimit.recordFailedAttempt('u1'), {});
+  assert.ok((await rateLimit.recordFailedAttempt('u1')).lockedUntil instanceof Date);
+  assert.equal((await rateLimit.checkRateLimit('u1')).allowed, false);
+  await rateLimit.resetRateLimit('u1');
+  assert.equal((await rateLimit.checkRateLimit('u1')).allowed, true);
+  await replay.markOtpUsed('u1', '654321');
+  assert.equal(await replay.isOtpReplayed('u1', '654321'), true);
+  await client.twoFactorOtpUsed.updateMany({ data: { expiresAt: new Date(Date.now() - 1000) } });
+  assert.equal(await replay.isOtpReplayed('u1', '654321'), false);
+  assert.equal(await client.twoFactorOtpUsed.count(), 0);
+
+  // deleteSession reads the session's rows, then deletes them in one batch.
+  await transaction([
+    client.session.create({ data: { id: 's9', websiteId: 'w1' } }),
+    client.websiteEvent.create({
+      data: { id: 'e9', websiteId: 'w1', sessionId: 's9', visitId: 'v9', urlPath: '/' },
+    }),
+    client.heatmapEvent.createMany({
+      data: [
+        { id: 'h9', websiteId: 'w1', sessionId: 's9', visitId: 'v9', urlPath: '/', eventType: 1 },
+      ],
+    }),
+    client.sessionLink.createMany({
+      data: [{ websiteId: 'w1', sessionId: 's9', distinctId: 'd9' }],
+    }),
+  ]);
+  assert.deepEqual(await q.deleteSession('w1', 's9'), { id: 's9' });
+  for (const model of ['session', 'websiteEvent', 'heatmapEvent', 'sessionLink']) {
+    assert.equal(await client[model].count({ where: { websiteId: 'w1' } }), 0, model);
+  }
+
+  // deleteWebsite purges analytics rows in chunks before the atomic batch,
+  // including event_data whose website_id drifted from its event's.
   const N = 12_000;
   await e2e
     .prepare(
@@ -390,10 +519,26 @@ try {
        select 'e' || x, 'w2', 's1', 'v1', '/', 1, '2026-01-01T00:00:00.000Z' from c`,
     )
     .run();
-  await client.session.create({ data: { id: 's1', websiteId: 'w2' } });
+  await transaction([
+    client.session.create({ data: { id: 's1', websiteId: 'w2' } }),
+    client.eventData.create({
+      data: { id: 'ed1', websiteId: 'drifted', websiteEventId: 'e1', dataKey: 'k', dataType: 1 },
+    }),
+    client.heatmapEvent.createMany({
+      data: [
+        { id: 'h1', websiteId: 'w2', sessionId: 's1', visitId: 'v1', urlPath: '/', eventType: 1 },
+      ],
+    }),
+    client.sessionLink.createMany({
+      data: [{ websiteId: 'w2', sessionId: 's1', distinctId: 'd1' }],
+    }),
+    client.annotation.create({ data: { id: 'a3', websiteId: 'w2', date: new Date(), note: 'x' } }),
+  ]);
   await q.deleteWebsite('w2');
-  assert.equal(await client.websiteEvent.count({ where: { websiteId: 'w2' } }), 0);
-  assert.equal(await client.session.count({ where: { websiteId: 'w2' } }), 0);
+  for (const model of ['websiteEvent', 'session', 'heatmapEvent', 'sessionLink', 'annotation']) {
+    assert.equal(await client[model].count({ where: { websiteId: 'w2' } }), 0, model);
+  }
+  assert.equal(await client.eventData.count({ where: { id: 'ed1' } }), 0);
   assert.equal(await client.website.findUnique({ where: { id: 'w2' } }), null);
 
   // deleteUser removes only that user's websites, owned teams and memberships.
@@ -403,6 +548,15 @@ try {
   assert.deepEqual(ids(await client.teamUser.findMany({})), ['tu1']);
   assert.deepEqual(ids(await client.website.findMany({})), ['w1', 'w3', 'w4']);
   assert.deepEqual(ids(await client.report.findMany({})), ['r1']);
+
+  // 2FA setup/confirm: recorded writes, then markOtpUsed's upsert, in one transaction.
+  await transaction(async tx => {
+    await tx.twoFactorBackupCode.deleteMany({ where: { userId: 'u1' } });
+    await tx.twoFactorBackupCode.createMany({ data: [{ userId: 'u1', codeHash: 'c1' }] });
+    await replay.markOtpUsed('u1', '111111', tx);
+  });
+  assert.equal(await replay.isOtpReplayed('u1', '111111'), true);
+  assert.equal(await client.twoFactorBackupCode.count({ where: { userId: 'u1' } }), 1);
 
   console.log('drizzle-d1 compat: OK');
 } finally {

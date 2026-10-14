@@ -9,7 +9,7 @@ below). This file is for rebuilding context after a merge conflict.
 ## Deploy
 
 ```
-pnpm install
+pnpm install       # upstream pins pnpm 12.3.4 (engines.pnpm)
 pnpm cf:build      # checks, shims, next build, OpenNext build, size check
 pnpm cf:deploy     # wrangler deploy of .open-next/
 ```
@@ -22,9 +22,16 @@ pnpm cf:deploy     # wrangler deploy of .open-next/
      `check-drizzle-d1`   — compat layer + upstream queries against in-memory D1
      `check-d1-import`    — import-script SQL generation against node:sqlite
   3. `cf:shims:pre`       — stub pg-cloudflare and the PG Prisma WASM in node_modules
-  4. `build-tracker`, `build-recorder` — `public/script.js`, `public/recorder.js`
-  5. `cf:next-build`      — `next build` with `DATABASE_FLAVOR=d1`
-  6. `cf:shims:post`      — same stubs in `.next/standalone/`
+  4. `build:tracker`, `build:recorder`, `build:openapi`, `build:packages` —
+     `public/script.js`, `public/recorder.js`, `public/openapi.json`, and the
+     `packages/*` workspace builds (`@umami/mcp`, `@umami/api-client`) the app imports
+  5. `cf:next-build`      — `next build --webpack` with `DATABASE_FLAVOR=d1`.
+                            Not Turbopack: it copies shared server modules (redis,
+                            zod, the Prisma client, drizzle) into each route's chunk,
+                            and with v3.4's API routes the worker was 13.3 MiB
+                            gzipped; webpack shares them (3.9 MiB)
+  6. `cf:shims:post`      — same stubs in `.next/standalone/` (webpack bundles pg
+                            with the stubbed pg-cloudflare, so that one may be absent)
   7. `cf:build-app`       — `opennextjs-cloudflare build --skipNextBuild`
   8. `cf:shims:bundle`    — empty OpenNext's copy of `.env`, drop stray `.env*`/GeoLite
   9. `cf:shims:restore`   — put node_modules back so the local Postgres path works
@@ -60,7 +67,9 @@ over `src/db/d1/schema.ts`, so upstream's ~80 `prisma.client.*` call sites run
 unchanged. Supported:
 
 - `findUnique/findFirst/findMany/count/create/createMany/update/updateMany/
-  delete/deleteMany` (no `upsert`; nothing upstream calls it)
+  upsert/delete/deleteMany`; `upsert` is `INSERT … ON CONFLICT (where's unique
+  columns) DO UPDATE`, so those columns need a unique index
+- `{ increment }` / `{ decrement }` in update data
 - `where`: equality, null, `in`/`notIn` (one `json_each` parameter however long
   the list), comparisons, `contains/startsWith/endsWith`, `AND/OR/NOT` (array
   or object), compound unique keys (`websiteId_visitId`), and relation filters
@@ -71,7 +80,18 @@ unchanged. Supported:
 - `transaction([...])` and `transaction(async tx => ...)` as one atomic
   `db.batch()`. Writes are lazy like `PrismaPromise`. In the callback form,
   only the write you return resolves to a row; using an earlier write's
-  result throws, and reads throw.
+  result throws. Reads run immediately and are allowed only before the first
+  write (they can't see pending writes); an upsert before any other write also
+  runs immediately (2FA's rate limit reads its row), after one it's batched.
+  `tx.$executeRawUnsafe` takes upstream's PG SQL: `$1` params, and
+  `DELETE … USING` (deleteWebsite) rewritten to a rowid subquery; it runs with
+  the chunked purges below, not in the batch.
+- `onDelete: Cascade` relations (upstream uses `relationMode = "prisma"`, so
+  Prisma cascades in the client): deleting a `user` deletes its API keys and
+  2FA rows in the same batch (`CASCADES`).
+- Reads return `DateTime` columns as `Date` (the `timestamp` column type in
+  `schema.ts`), like Prisma; upstream compares them in JS (API-key last use,
+  2FA lockout and OTP expiry).
 
 Anything it can't translate **throws** (unknown `where` keys, operators,
 relations, selects). Silently dropping a filter once returned every team to
@@ -86,15 +106,20 @@ D1-specific behavior in the compat layer:
   boolean → 0/1, BigInt → number. JSON columns use Drizzle's json mode.
 - `createMany` splits rows so no statement binds more than 100 parameters.
 - `deleteMany` on the analytics tables (`website_event`, `event_data`,
-  `session_data`, `session`, `revenue`, `session_replay`) first deletes in
+  `session_data`, `session`, `revenue`, `session_replay`, `heatmap_event`,
+  `session_link`) first deletes in
   5000-row chunks outside the batch, so deleting a large website fits D1's
   30-second query limit. That part isn't atomic; the final batch is.
 
-**SQL helpers.** `rawQuery`, `parseFilters`, `getDateSQL` and friends emit
-SQLite. Queries in `src/queries/sql/**` that use only these helpers run as-is.
-Files with PG-only SQL have a sibling in `src/queries/sqlite/**` (same path)
-wired with one `[D1]: () => sqliteFoo(...args)` key in their `runQuery` call;
-`scripts/check-d1-coverage.js` fails when a PG-only pattern has no sibling.
+**SQL helpers.** `rawQuery`, `parseFilters` (including event/session
+property filters), `getDateSQL`, `getDateStringSQL` and friends emit SQLite
+with the same output as the PG helpers. Queries in `src/queries/sql/**` that
+use only these helpers run as-is. Files with PG-only SQL have a sibling in
+`src/queries/sqlite/**` (same path) wired with one import and one
+`d1: () => sqliteFoo(...args)` key in their `runQuery` call. The key is a
+literal, not `[D1]` imported from `@/lib/db`: upstream's unit tests mock
+`@/lib/db` without a `D1` export. `scripts/check-d1-coverage.js` fails when a
+PG-only pattern has no sibling.
 
 ### Behavior differences on D1
 
@@ -103,13 +128,23 @@ wired with one `[D1]: () => sqliteFoo(...args)` key in their `runQuery` call;
   (computed with Intl, cached per zone) from 2015-01-01 to two years ahead.
   Older timestamps use the 2015 offset.
 - Regex filters (`re`/`nre`) aren't available; SQLite has no `REGEXP`. The UI
-  hides them (`/api/config` → `regexFiltersDisabled`), and the server still
-  rejects them in hand-made URLs or saved segments.
+  hides them (`NEXT_PUBLIC_DATABASE_FLAVOR=d1`, set by `cf:next-build` and
+  `cf:dev`), and the server still rejects them in hand-made URLs or saved
+  segments.
 - `LIKE` is case-insensitive for ASCII only (PG `ILIKE` folds Unicode), and
   D1 caps a LIKE pattern at 50 bytes.
 - Timestamps are ISO text (`…T…Z`). `created_at` defaults come from the app;
   the DDL's `CURRENT_TIMESTAMP` default writes a different format, and
-  migration `0002` rewrites rows that used it.
+  migration `0002` rewrites rows that used it (tables added from `0004` on
+  default to ISO `strftime` instead). Raw-SQL queries return them as strings;
+  the compat client returns `Date`.
+- No foreign keys: D1 can't turn `foreign_keys` off, so a cascade would fire
+  when a migration rebuilds a parent table. Cascades are in the compat layer.
+- `0008_lowercase_username` suffixes colliding soft-deleted usernames with
+  the user id's last 8 hex digits (PG uses an MD5 prefix), and SQLite's
+  `lower()` folds ASCII only.
+- Existing tables' nullable `updated_at` columns aren't set on update (Prisma's
+  `@updatedAt`); the 2FA and annotation tables' are.
 - With `CACHE_BACKEND=kv`, umami's Redis-only behavior turns on: login tokens
   expire after an hour, website/link/pixel lookups are cached for 24 hours
   (edits and deletes take up to a day to apply outside cloud mode), and KV's
@@ -171,25 +206,28 @@ Upstream files touched (re-apply the same idea if a merge conflicts; don't
 take upstream's side blindly or the D1 path breaks):
 
 - `src/lib/prisma.ts` — import `drizzle-d1`, `IS_D1`, `pgModule` +
-  one-line swapped default export
-- `src/lib/db.ts` — `D1` constant; `runQuery` dispatches `[D1]`, falling back
-  to `[PRISMA]`
+  one-line swapped default export; `getSchema()` (a named export
+  `src/queries/prisma/website.ts` imports) defers to the D1 module
+- `src/lib/db.ts` — `D1` constant; `runQuery` dispatches `d1`, falling back
+  to `[PRISMA]`; `isRelationalOnly()` includes D1 (session deletion)
 - `src/lib/redis.ts` — use the KV client when `CACHE_BACKEND=kv` and the
   `CACHE` binding exists
-- `src/lib/crypto.ts` — `secret()` throws when unset
+- `src/lib/crypto.ts` — `secret()` throws when unset on D1
 - `src/lib/detect.ts` — synchronous local-IP check (is-localhost-ip hangs on
   workerd), `request.cf` geo, tolerate a missing GeoLite database
 - `src/lib/kafka.ts`, `src/lib/clickhouse.ts` — lazy imports (bundle size)
-- `src/queries/sql/**` files with a `[D1]` key — one import + one key each;
+- `src/queries/sql/**` files with a `d1:` key — one import + one key each
+  (`getWebsiteListCharts` calls its file's `formatResults` too);
   `check-d1-coverage` lists them
 - `next.config.ts` — `initOpenNextCloudflareForDev()` when `CF_DEV=1`
 - `prisma.config.ts` — tolerate a missing `DATABASE_URL` (D1 builds)
 - `package.json` (`cf:*`, `d1:*`, `check-*` scripts; drizzle-orm, OpenNext,
-  wrangler, miniflare), `pnpm-workspace.yaml` (`workerd` build script),
-  `.gitignore`
-- `src/app/api/config/route.ts`, `src/components/hooks/useConfig.ts`,
-  `src/components/hooks/useFilters.ts` — `regexFiltersDisabled` hides
-  `re`/`nre` on D1
+  wrangler, miniflare), `pnpm-workspace.yaml` (`workerd: true` in
+  `allowBuilds`), `.gitignore`. OpenNext is pinned to the newest release whose
+  `next` peer range covers upstream's `next`.
+- `src/components/hooks/useFilters.ts` — hides `re`/`nre` when built with
+  `NEXT_PUBLIC_DATABASE_FLAVOR=d1` (a build-time flag: reading `/api/config`
+  there pulled the app store into upstream's hook tests)
 
 ## Shims
 
@@ -210,14 +248,20 @@ table and id (use `--exclude=session_replay` if replay chunks are too big).
 Writes are `INSERT … ON CONFLICT (pk) DO UPDATE`, so re-runs are idempotent;
 runs are not resumable.
 
-- Mutable tables (user, team, team_user, website, report, segment, link,
-  pixel, board, share, session_replay_saved) start with `DELETE FROM` on every
-  run, so deletions in Supabase propagate. `--skip-mutable` leaves them alone.
-- Append-only tables (session, website_event, event_data, session_data,
-  revenue, session_replay) honor `--since=<ISO>`. Each run prints the
-  `--since` to use next (its snapshot time minus an hour of margin).
-- `session_data` keeps only the newest row per `(session_id, data_key)`, as
-  umami's own `saveSessionData` does.
+- Mutable tables (user, api_key, two_factor_*, app_setting, team, team_user,
+  website, report, segment, annotation, link, pixel, board, share,
+  session_replay_saved) start with `DELETE FROM` on every run, so deletions in
+  Supabase propagate. `--skip-mutable` leaves them alone.
+- Append-only tables (session, session_link, website_event, event_data,
+  session_data, revenue, session_replay, heatmap_event) honor `--since=<ISO>`.
+  Each run prints the `--since` to use next (its snapshot time minus an hour of
+  margin).
+- `session_data` keeps only the newest row per `(session_id, data_key)` (D1's
+  unique key; it upserts on it), as umami's own `saveSessionData` does.
+- The source may be on an older upstream schema: tables it lacks stay empty,
+  columns it lacks get D1 defaults, `website.replay_enabled` is read as
+  `recorder_enabled` (with upstream migration 20's `replay_config` merge), and
+  `0008_lowercase_username.sql` runs again after `user` is copied.
 - A missing core table, or a source column D1 doesn't have, fails the run
   unless allowed with `--allow-drop=table.col,...`.
 - Validation compares row counts and `max(created_at)` per table and exits
@@ -225,7 +269,7 @@ runs are not resumable.
 
 Runbook (each step is `pnpm d1:import:remote <flags>`, which targets remote D1):
 
-1. `pnpm d1:migrate:prod` (applies `0001`–`0003`) and set `APP_SECRET`.
+1. `pnpm d1:migrate:prod` (applies `0001`–`0010`) and set `APP_SECRET`.
 2. Days ahead: a full run (no flags), then
    `wrangler d1 execute umami --remote --command "PRAGMA optimize"`.
 3. Smoke-test the Worker on `workers.dev` against the imported data. Lower the
@@ -249,11 +293,23 @@ until you're past the point you'd roll back.
 
 ## After merging upstream
 
-- `pnpm build-db-client` once (generates the Prisma client the checks import),
-  then `pnpm check-d1-coverage`, `pnpm check-drizzle-d1`, `pnpm check-d1-import`,
-  `pnpm test` (includes `src/queries/sqlite/d1-smoke.test.ts`, which runs every
-  `src/queries/sql/**` query on an in-memory SQLite with D1's limits and fails
-  if a new upstream query isn't in its list)
+- `pnpm generate:db:client` once (generates the Prisma client the checks
+  import; upstream renamed it from `build-db-client`), `pnpm build:packages`
+  (upstream tests import the workspace packages), then `pnpm check-d1-coverage`,
+  `pnpm check-drizzle-d1`, `pnpm check-d1-import`, `pnpm test` (includes
+  `src/queries/sqlite/d1-smoke.test.ts`, which runs every `src/queries/sql/**`
+  query on an in-memory SQLite with D1's limits and fails if a new upstream
+  query isn't in its list). Under Node 26 several upstream UI tests fail on a
+  missing `localStorage` (they do on pristine upstream too); run with
+  `NODE_OPTIONS=--localstorage-file=<path>` to get a clean run.
+- Upstream PG helper changes in `src/lib/prisma.ts` (output formats, new
+  helpers, `parseFilters`) need the same change in `drizzle-d1.ts`; the
+  `satisfies` check only catches missing names.
+- Upstream changes to a PG query that has a sibling need porting to the
+  sibling: `git diff -M <old upstream> upstream/master -- src/queries/sql`.
+- Upstream code using a new Prisma op, relation, `onDelete: Cascade`, or a
+  JS-side date comparison: the compat layer throws on the first two; add
+  cascades to `CASCADES`.
 - New upstream Prisma migrations: port each by hand to a new
   `prisma/migrations-d1/NNNN_*.sql` and mirror it in `src/db/d1/schema.ts`;
   `check-drizzle-d1` fails if the two disagree.

@@ -1,5 +1,6 @@
 import { subMinutes } from 'date-fns';
 import prisma from '@/lib/prisma';
+import type { ActiveVisitors } from '@/lib/types';
 
 const FUNCTION_NAME = 'getActiveVisitors';
 
@@ -7,7 +8,7 @@ const FUNCTION_NAME = 'getActiveVisitors';
 // index and filters created_at across the site's whole history (seconds at a
 // few million rows, polled every minute per open dashboard). INDEXED BY
 // keeps it a range seek over the last five minutes.
-export async function sqliteGetActiveVisitors(websiteId: string) {
+export async function sqliteGetActiveVisitors(websiteId: string): Promise<ActiveVisitors | null> {
   const { rawQuery } = prisma;
   const startDate = subMinutes(new Date(), 5);
 

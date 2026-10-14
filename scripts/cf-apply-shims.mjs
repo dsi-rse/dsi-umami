@@ -9,7 +9,9 @@
  *     1. pg-cloudflare/package.json: its `workerd` export points at a file
  *        OpenNext's package copy drops, so bundling fails with "Could not
  *        resolve pg-cloudflare". pg never runs with DATABASE_FLAVOR=d1, so
- *        point every condition at the empty stub.
+ *        point every condition at the empty stub. `next build --webpack`
+ *        bundles pg (and this stub) into .next/server, so .next/standalone
+ *        may have no copy.
  *     2. @prisma/client's PostgreSQL query-compiler WASM (base64 .mjs). The PG
  *        client is imported statically but never used on D1; stubbing it
  *        saves ~1.5 MB gzipped against the 10 MiB Workers limit.
@@ -64,6 +66,7 @@ const PG_WASM_STUB = "export default '';\n";
 const TARGETS = [
   {
     name: 'pg-cloudflare',
+    bundled: true,
     match: file =>
       path.basename(file) === 'package.json' &&
       path.basename(path.dirname(file)) === 'pg-cloudflare',
@@ -111,7 +114,10 @@ function applyStubs(root, keepOriginals) {
   const files = [...walk(root)];
   for (const target of TARGETS) {
     const matches = files.filter(target.match);
-    if (matches.length === 0) fail(`no ${target.name} found under ${root}; update the shim`);
+    if (matches.length === 0) {
+      if (target.bundled && !keepOriginals) continue;
+      fail(`no ${target.name} found under ${root}; update the shim`);
+    }
     for (const file of matches) {
       if (keepOriginals && !existsSync(file + ORIG)) {
         // Stubbed by an older version of this script, with no original kept.

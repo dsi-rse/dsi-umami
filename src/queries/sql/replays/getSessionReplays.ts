@@ -1,25 +1,26 @@
 import clickhouse from '@/lib/clickhouse';
-import { CLICKHOUSE, D1, PRISMA, runQuery } from '@/lib/db';
+import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
-import type { QueryFilters } from '@/lib/types';
+import type { PageResult, QueryFilters, SessionReplaySummary } from '@/lib/types';
 import sqliteGetSessionReplays from '@/queries/sqlite/replays/getSessionReplays';
 
 const FUNCTION_NAME = 'getSessionReplays';
 
 export function getSessionReplays(
   ...args: [websiteId: string, filters: QueryFilters, sessionId?: string]
-) {
+): Promise<PageResult<SessionReplaySummary[]>> {
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
-    [D1]: () => sqliteGetSessionReplays(...args),
+    d1: () => sqliteGetSessionReplays(...args),
   });
 }
 
 async function relationalQuery(websiteId: string, filters: QueryFilters, sessionId?: string) {
   const { pagedRawQuery, parseFilters } = prisma;
-  const { search } = filters;
-  const { filterQuery, cohortQuery, queryParams } = parseFilters({
+  const { search, minDuration } = filters;
+  const minDurationMs = minDuration && minDuration > 0 ? minDuration * 1000 : undefined;
+  const { filterQuery, cohortQuery, queryParams, joinSessionQuery } = parseFilters({
     ...filters,
     websiteId,
     search: search ? `%${search}%` : undefined,
@@ -29,6 +30,7 @@ async function relationalQuery(websiteId: string, filters: QueryFilters, session
     filterQuery || cohortQuery
       ? `join (select distinct website_event.website_id, website_event.session_id, website_event.visit_id
                from website_event
+               ${joinSessionQuery}
                ${cohortQuery}
                where website_event.website_id = {{websiteId::uuid}}
                   and website_event.created_at between {{startDate}} and {{endDate}}
@@ -46,6 +48,10 @@ async function relationalQuery(websiteId: string, filters: QueryFilters, session
            or session.browser ilike {{search}}
            or session.os ilike {{search}}
            or session.device ilike {{search}})`
+    : '';
+
+  const havingQuery = minDurationMs
+    ? `having sum(extract(epoch from sr.ended_at - sr.started_at) * 1000) >= {{minDurationMs}}`
     : '';
 
   return pagedRawQuery(
@@ -81,9 +87,10 @@ async function relationalQuery(websiteId: string, filters: QueryFilters, session
       session.device,
       session.country,
       session.city
+    ${havingQuery}
     order by max(sr.created_at) desc
     `,
-    { ...queryParams, sessionId },
+    { ...queryParams, sessionId, minDurationMs },
     filters,
     FUNCTION_NAME,
   );
@@ -91,7 +98,8 @@ async function relationalQuery(websiteId: string, filters: QueryFilters, session
 
 async function clickhouseQuery(websiteId: string, filters: QueryFilters, sessionId?: string) {
   const { pagedRawQuery, parseFilters } = clickhouse;
-  const { search } = filters;
+  const { search, minDuration } = filters;
+  const minDurationMs = minDuration && minDuration > 0 ? minDuration * 1000 : undefined;
   const { queryParams, cohortQuery, filterQuery } = parseFilters({
     ...filters,
     websiteId,
@@ -105,6 +113,10 @@ async function clickhouseQuery(websiteId: string, filters: QueryFilters, session
            or (positionCaseInsensitive(browser, {search:String}) > 0)
            or (positionCaseInsensitive(os, {search:String}) > 0)
            or (positionCaseInsensitive(device, {search:String}) > 0))`
+    : '';
+
+  const havingQuery = minDurationMs
+    ? `having toInt64(sum(toUnixTimestamp64Milli(session_replay.ended_at) - toUnixTimestamp64Milli(session_replay.started_at))) >= {minDurationMs:Int64}`
     : '';
 
   return pagedRawQuery(
@@ -122,7 +134,7 @@ async function clickhouseQuery(websiteId: string, filters: QueryFilters, session
       count(session_replay.replay_id) as chunkCount,
       min(session_replay.started_at) as startedAt,
       max(session_replay.ended_at) as endedAt,
-      toInt64(sum(dateDiff('millisecond', session_replay.started_at, session_replay.ended_at))) as duration,
+      toInt64(sum(toUnixTimestamp64Milli(session_replay.ended_at) - toUnixTimestamp64Milli(session_replay.started_at))) as duration,
       max(session_replay.created_at) as createdAt
     from session_replay
     join (
@@ -141,9 +153,10 @@ async function clickhouseQuery(websiteId: string, filters: QueryFilters, session
         and session_replay.created_at between {startDate:DateTime64} and {endDate:DateTime64}
     ${sessionFilter}
     group by session_replay.visit_id, session_replay.session_id, session_replay.website_id, website_event.browser, website_event.os, website_event.device, website_event.country, website_event.city
+    ${havingQuery}
     order by max(created_at) desc
     `,
-    { ...queryParams, sessionId },
+    { ...queryParams, sessionId, minDurationMs },
     filters,
     FUNCTION_NAME,
   );

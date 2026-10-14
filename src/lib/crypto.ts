@@ -55,8 +55,8 @@ export function md5(...args: string[]) {
 
 export function secret() {
   const value = process.env.APP_SECRET || process.env.DATABASE_URL;
-  // Unset, every token would be signed with hash('') (D1 has no DATABASE_URL).
-  if (!value) throw new Error('APP_SECRET is not set');
+  // Unset on D1 (no DATABASE_URL), every token would be signed with hash('').
+  if (!value && process.env.DATABASE_FLAVOR === 'd1') throw new Error('APP_SECRET is not set');
   return hash(value);
 }
 

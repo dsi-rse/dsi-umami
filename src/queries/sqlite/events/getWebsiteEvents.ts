@@ -1,23 +1,71 @@
+import { DEFAULT_PAGE_SIZE, EVENT_TYPE } from '@/lib/constants';
 import prisma from '@/lib/prisma';
-import type { QueryFilters } from '@/lib/types';
+import type { PageResult, QueryFilters, WebsiteEvent } from '@/lib/types';
 
 const FUNCTION_NAME = 'getWebsiteEvents';
 
-export async function sqliteGetWebsiteEvents(websiteId: string, filters: QueryFilters) {
-  const { pagedRawQuery, parseFilters } = prisma;
-  const { search } = filters;
-  const { filterQuery, dateQuery, cohortQuery, queryParams } = parseFilters({
+// PG: same query with `ilike`. hasData comes back as 0/1 and is mapped to a
+// boolean like PG's.
+export async function sqliteGetWebsiteEvents(
+  websiteId: string,
+  filters: QueryFilters,
+): Promise<PageResult<WebsiteEvent[]>> {
+  const { rawQuery, parseFilters } = prisma;
+  const { search, page = 1, pageSize, maxResults, orderBy } = filters;
+  const size = +pageSize || DEFAULT_PAGE_SIZE;
+  const offset = +size * (+page - 1);
+  const { filterQuery, dateQuery, cohortQuery, joinSessionQuery, queryParams } = parseFilters({
     ...filters,
     websiteId,
   });
+  const hasDataDateQuery = dateQuery.replaceAll('website_event.', 'event_data.');
+  const params = { ...queryParams, ...(search ? { eventSearch: `%${search}%` } : {}) };
 
   const searchQuery = search
-    ? `and ((event_name LIKE {{search}} and event_type = 2)
-           or (url_path LIKE {{search}} and event_type = 1))`
+    ? `and ((event_name LIKE {{eventSearch}} and event_type = ${EVENT_TYPE.customEvent})
+           or (url_path LIKE {{eventSearch}} and event_type = ${EVENT_TYPE.pageView}))`
     : '';
 
-  return pagedRawQuery(
+  const fromQuery = `
+    from website_event
+    ${cohortQuery}
+    ${joinSessionQuery}
+    where website_event.website_id = {{websiteId}}
+      and website_event.event_type != ${EVENT_TYPE.performance}
+    ${dateQuery}
+    ${filterQuery}
+    ${searchQuery}
+  `;
+
+  // Explicit aliases: SQLite resolves `order by created_at` against the
+  // joined tables (ambiguous with session.created_at) unless it's an alias.
+  const eventQuery = `
+    select
+      website_event.event_id as event_id,
+      website_event.created_at as created_at
+    ${fromQuery}
+  `;
+
+  const countQuery = maxResults
+    ? `select count(*) as num from (select 1 from (${eventQuery}) t limit ${+maxResults}) t2`
+    : `select count(*) as num ${fromQuery}`;
+
+  const count = await rawQuery(countQuery, params).then(res => Number(res[0].num));
+
+  const data = await rawQuery(
     `
+    with paged_events as (
+      ${eventQuery}
+      order by created_at desc
+      limit ${size} offset ${offset}
+    ),
+    paged_event_data as (
+      select distinct event_data.website_event_id as event_id
+      from event_data
+      join paged_events on paged_events.event_id = event_data.website_event_id
+      where event_data.website_id = {{websiteId}}
+      ${hasDataDateQuery}
+    )
     select
       website_event.event_id as "id",
       website_event.website_id as "websiteId",
@@ -30,31 +78,33 @@ export async function sqliteGetWebsiteEvents(websiteId: string, filters: QueryFi
       website_event.referrer_query as "referrerQuery",
       website_event.referrer_domain as "referrerDomain",
       session.country as country,
-      city as city,
-      device as device,
-      os as os,
-      browser as browser,
-      page_title as "pageTitle",
+      session.city as city,
+      session.device as device,
+      session.os as os,
+      session.browser as browser,
+      website_event.page_title as "pageTitle",
       website_event.event_type as "eventType",
       website_event.event_name as "eventName",
-      event_id IN (select website_event_id
-                   from event_data
-                   where website_id = {{websiteId}}
-                      and created_at between {{startDate}} and {{endDate}}) AS "hasData"
-    from website_event
-    ${cohortQuery}
-    join session on session.session_id = website_event.session_id
+      (paged_event_data.event_id is not null) as "hasData"
+    from paged_events
+    join website_event on website_event.event_id = paged_events.event_id
+    left join session on session.session_id = website_event.session_id
       and session.website_id = website_event.website_id
-    where website_event.website_id = {{websiteId}}
-    ${dateQuery}
-    ${filterQuery}
-    ${searchQuery}
-    order by website_event.created_at desc
+    left join paged_event_data on paged_event_data.event_id = website_event.event_id
+    order by paged_events.created_at desc
     `,
-    queryParams,
-    filters,
+    params,
     FUNCTION_NAME,
-  );
+  ).then((rows: any[]) => rows.map(row => ({ ...row, hasData: !!row.hasData })));
+
+  return {
+    data,
+    count,
+    page: +page,
+    pageSize: size,
+    orderBy,
+    isCapped: !!maxResults && +count >= +maxResults,
+  } as PageResult<WebsiteEvent[]>;
 }
 
 export default sqliteGetWebsiteEvents;

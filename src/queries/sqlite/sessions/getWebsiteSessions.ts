@@ -1,9 +1,13 @@
+import { EVENT_TYPE } from '@/lib/constants';
 import prisma from '@/lib/prisma';
-import type { QueryFilters } from '@/lib/types';
+import type { PageResult, QueryFilters, WebsiteSession } from '@/lib/types';
 
 const FUNCTION_NAME = 'getWebsiteSessions';
 
-export async function sqliteGetWebsiteSessions(websiteId: string, filters: QueryFilters) {
+export async function sqliteGetWebsiteSessions(
+  websiteId: string,
+  filters: QueryFilters,
+): Promise<PageResult<WebsiteSession[]>> {
   const { pagedRawQuery, parseFilters } = prisma;
   const { search } = filters;
   const { filterQuery, dateQuery, cohortQuery, queryParams } = parseFilters({
@@ -37,14 +41,15 @@ export async function sqliteGetWebsiteSessions(websiteId: string, filters: Query
       min(website_event.created_at) as "firstAt",
       max(website_event.created_at) as "lastAt",
       count(distinct website_event.visit_id) as "visits",
-      sum(case when website_event.event_type = 1 then 1 else 0 end) as "views",
-      sum(case when website_event.event_type = 2 then 1 else 0 end) as "events",
+      sum(case when website_event.event_type = ${EVENT_TYPE.pageView} then 1 else 0 end) as "views",
+      sum(case when website_event.event_type = ${EVENT_TYPE.customEvent} then 1 else 0 end) as "events",
       max(website_event.created_at) as "createdAt"
     from website_event
     ${cohortQuery}
     join session on session.session_id = website_event.session_id
       and session.website_id = website_event.website_id
     where website_event.website_id = {{websiteId}}
+      and website_event.event_type != ${EVENT_TYPE.performance}
     ${dateQuery}
     ${filterQuery}
     ${searchQuery}
@@ -59,11 +64,11 @@ export async function sqliteGetWebsiteSessions(websiteId: string, filters: Query
       session.country,
       session.region,
       session.city
-    order by max(website_event.created_at) desc
     `,
     queryParams,
     filters,
     FUNCTION_NAME,
+    'max(website_event.created_at) desc, session.session_id',
   );
 }
 

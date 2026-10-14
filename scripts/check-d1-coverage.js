@@ -2,7 +2,7 @@
 /**
  * Verifies that every src/queries/sql/*.ts file containing PG-specific SQL
  * patterns also has a matching D1/SQLite sibling under src/queries/sqlite/
- * and wires it via a `[D1]:` key on the runQuery dispatch.
+ * and wires it via a `d1:` key on the runQuery dispatch.
  *
  * Best-effort static check. The fork has no CI, so run it by hand after
  * merging upstream: new upstream queries that introduce PG-only syntax will
@@ -92,7 +92,7 @@ for (const file of walk(SQL_DIR)) {
     hasSibling = false;
   }
 
-  const hasD1Key = /\[\s*D1\s*\]\s*:/.test(src);
+  const hasD1Key = /\bd1\s*:/.test(src);
 
   if (!hasSibling || !hasD1Key) {
     problems++;
@@ -102,7 +102,7 @@ for (const file of walk(SQL_DIR)) {
       console.error(`    missing sibling: src/queries/sqlite/${rel}`);
     }
     if (!hasD1Key) {
-      console.error(`    missing [D1]: dispatch entry in runQuery({...})`);
+      console.error(`    missing d1: dispatch entry in runQuery({...})`);
     }
   }
 }

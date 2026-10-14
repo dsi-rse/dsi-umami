@@ -32,9 +32,15 @@ import {
 } from 'drizzle-orm';
 import { type DrizzleD1Database, drizzle } from 'drizzle-orm/d1';
 import * as schema from '@/db/d1/schema';
-import { DEFAULT_PAGE_SIZE, FILTER_COLUMNS, OPERATORS, SESSION_COLUMNS } from './constants';
+import {
+  DATA_TYPE,
+  DEFAULT_PAGE_SIZE,
+  FILTER_COLUMNS,
+  OPERATORS,
+  SESSION_COLUMNS,
+} from './constants';
 import { filtersObjectToArray } from './params';
-import type { Operator, QueryFilters, QueryOptions } from './types';
+import type { Operator, PropertyFilter, QueryFilters, QueryOptions } from './types';
 
 const log = debug('umami:drizzle-d1');
 
@@ -67,12 +73,13 @@ const db: DB = new Proxy({} as DB, {
 //
 // Coverage:
 //   ✓ findUnique, findFirst, findMany, create, createMany, update,
-//     updateMany, delete, deleteMany, count (no upsert: nothing calls it)
+//     updateMany, delete, deleteMany, count, upsert (on a unique where)
 //   ✓ where: equality, null/notNull, in/notIn, gt/gte/lt/lte, contains,
 //     startsWith, endsWith, AND, OR, NOT, and the relation filters listed in
 //     RELATIONS. Unknown keys/operators throw.
 //   ✓ transaction([...]) and transaction(async tx => ...) as one atomic
-//     db.batch() (writes only)
+//     db.batch() (see transaction() for what the callback form allows)
+//   ✓ `{ increment }` / `{ decrement }` in update data
 //   ✓ compound unique keys (`websiteId_visitId: { websiteId, visitId }`)
 //   ✓ orderBy (single column or array, asc/desc), take, skip, distinct
 //   ✓ top-level `select` / `omit` of columns (also on create/update returning)
@@ -97,6 +104,15 @@ const MODEL_TO_TABLE: Record<string, any> = {
   share: schema.share,
   sessionReplay: schema.sessionReplay,
   sessionReplaySaved: schema.sessionReplaySaved,
+  sessionLink: schema.sessionLink,
+  heatmapEvent: schema.heatmapEvent,
+  annotation: schema.annotation,
+  apiKey: schema.apiKey,
+  twoFactorAuth: schema.twoFactorAuth,
+  twoFactorBackupCode: schema.twoFactorBackupCode,
+  twoFactorOtpUsed: schema.twoFactorOtpUsed,
+  twoFactorRateLimit: schema.twoFactorRateLimit,
+  appSetting: schema.appSetting,
 };
 
 // Relations reachable from upstream where/include/_count clauses:
@@ -126,6 +142,29 @@ const RELATIONS = new Map<any, Record<string, Relation>>([
     },
   ],
 ]);
+
+// prisma/schema.prisma's `onDelete: Cascade` relations. With relationMode =
+// "prisma", Prisma deletes these children itself, so the compat layer does too,
+// in the same batch as the parent delete: [child table, column referencing id].
+const CASCADES = new Map<any, [any, string][]>([
+  [
+    schema.user,
+    [
+      [schema.apiKey, 'userId'],
+      [schema.twoFactorAuth, 'userId'],
+      [schema.twoFactorBackupCode, 'userId'],
+      [schema.twoFactorOtpUsed, 'userId'],
+      [schema.twoFactorRateLimit, 'userId'],
+    ],
+  ],
+]);
+
+function cascadeDeletes(table: any, cond: any) {
+  const parents = sql`select ${table.id} from ${table}${cond ? sql` where ${cond}` : sql``}`;
+  return (CASCADES.get(table) ?? []).map(([child, col]) =>
+    db.delete(child).where(sql`${child[col]} in (${parents})`),
+  );
+}
 
 const WHERE_OPS: Record<string, (col: any, v: any) => any> = {
   equals: (c, v) => (v === null ? isNull(c) : eq(c, bindable(v))),
@@ -359,8 +398,9 @@ async function withIncludes(table: any, rows: any[], args: any) {
 // callsites pass — Date → ISO, BigInt → Number, boolean → 0/1. `undefined`
 // keys are dropped, as Prisma does: partial updates keep existing values and
 // inserts get column defaults. JSON columns are `mode: 'json'` in the schema,
-// so objects pass through for Drizzle to stringify.
-function prepareWriteData(data: any): any {
+// so objects pass through for Drizzle to stringify. With `table` (updates),
+// Prisma's `{ increment: n }` / `{ decrement: n }` become column arithmetic.
+function prepareWriteData(data: any, table?: any): any {
   if (data === null || data === undefined) return data;
   if (typeof data !== 'object' || data instanceof Date) return data;
   const out: any = Array.isArray(data) ? [] : {};
@@ -372,6 +412,14 @@ function prepareWriteData(data: any): any {
       out[k] = Number(v);
     } else if (typeof v === 'boolean') {
       out[k] = v ? 1 : 0;
+    } else if (
+      table?.[k] &&
+      isPlainObject(v) &&
+      typeof ((v as any).increment ?? (v as any).decrement) === 'number'
+    ) {
+      const { increment, decrement } = v as any;
+      out[k] =
+        increment !== undefined ? sql`${table[k]} + ${increment}` : sql`${table[k]} - ${decrement}`;
     } else {
       out[k] = v;
     }
@@ -482,14 +530,14 @@ function modelOps(modelName: string) {
       ensureNoInclude(args, modelName, 'update');
       const cond = requireCondition(buildCondition(table, args?.where), modelName, 'update');
       const cols = projection(table, args, modelName, 'update');
-      const data = prepareWriteData(args.data);
+      const data = prepareWriteData(args.data, table);
       // Nothing left to set (all undefined): Prisma returns the row unchanged.
       if (isEmpty(data)) return deferred([db.select(cols).from(table).where(cond).limit(1)], first);
       return deferred([db.update(table).set(data).where(cond).returning(cols)], first);
     },
     updateMany(args: any) {
       const cond = buildCondition(table, args?.where);
-      const data = prepareWriteData(args.data);
+      const data = prepareWriteData(args.data, table);
       if (isEmpty(data)) {
         const q: any = db.select({ n: sql<number>`count(*)` }).from(table);
         return deferred([cond ? q.where(cond) : q], ([rows]) => ({ count: Number(rows[0].n) }));
@@ -497,16 +545,49 @@ function modelOps(modelName: string) {
       const q: any = db.update(table).set(data);
       return deferred([cond ? q.where(cond) : q], changes);
     },
+    // INSERT … ON CONFLICT (where's unique columns) DO UPDATE, one statement.
+    upsert(args: any) {
+      ensureNoInclude(args, modelName, 'upsert');
+      const cols = projection(table, args, modelName, 'upsert');
+      // `a: v` or compound `a_b: { a, b }`; the columns need a unique index.
+      const keys = Object.entries(args.where ?? {}).flatMap(([key, value]) =>
+        table[key] ? [key] : isPlainObject(value) ? Object.keys(value as object) : [key],
+      );
+      if (!keys.length || keys.some(k => !table[k])) {
+        throw new Error(`drizzle-compat: ${modelName}.upsert() needs a unique where`);
+      }
+      const update = prepareWriteData(args.update, table);
+      // An empty update still has to return the existing row: set a key to itself.
+      const set = isEmpty(update) ? { [keys[0]]: sql`${table[keys[0]]}` } : update;
+      const target = keys.map(k => table[k]);
+      return deferred(
+        [
+          db
+            .insert(table)
+            .values(prepareWriteData(args.create))
+            .onConflictDoUpdate({ target, set })
+            .returning(cols),
+        ],
+        first,
+      );
+    },
     delete(args: any) {
       const cond = requireCondition(buildCondition(table, args?.where), modelName, 'delete');
       const cols = projection(table, args, modelName, 'delete');
-      return deferred([db.delete(table).where(cond).returning(cols)], first);
+      return deferred(
+        [...cascadeDeletes(table, cond), db.delete(table).where(cond).returning(cols)],
+        results => first(results.slice(-1)),
+      );
     },
     deleteMany(args: any = {}) {
       const cond = buildCondition(table, args?.where);
       const q: any = db.delete(table);
       const prelude = BULK_TABLES.has(table) ? () => purgeInChunks(table, cond) : undefined;
-      return deferred([cond ? q.where(cond) : q], changes, prelude);
+      return deferred(
+        [...cascadeDeletes(table, cond), cond ? q.where(cond) : q],
+        results => changes(results.slice(-1)),
+        prelude,
+      );
     },
     async count(args: any = {}) {
       const cond = buildCondition(table, args?.where);
@@ -574,17 +655,9 @@ function getCastColumnQuery(field: string, type: string): string {
   return `CAST(${field} AS ${sqliteType})`;
 }
 
-// Same output strings as PG's DATE_FORMATS / DATE_FORMATS_UTC (src/lib/prisma.ts):
-// local wall time without a zone for a named timezone, ISO with Z for 'utc'.
+// Same output strings as PG's DATE_FORMATS (src/lib/prisma.ts): always
+// Z-suffixed, holding local wall time for a named timezone.
 const SQLITE_DATE_FORMATS: Record<string, string> = {
-  minute: '%Y-%m-%d %H:%M:00',
-  hour: '%Y-%m-%d %H:00:00',
-  day: '%Y-%m-%d 00:00:00',
-  month: '%Y-%m-01 00:00:00',
-  year: '%Y-01-01 00:00:00',
-};
-
-const SQLITE_DATE_FORMATS_UTC: Record<string, string> = {
   minute: '%Y-%m-%dT%H:%M:00Z',
   hour: '%Y-%m-%dT%H:00:00Z',
   day: '%Y-%m-%dT00:00:00Z',
@@ -672,11 +745,13 @@ function getTimezoneModifier(field: string, timezone?: string): string {
 }
 
 function getDateSQL(field: string, unit: string, timezone?: string): string {
-  if (timezone && timezone !== 'utc') {
-    return `strftime('${SQLITE_DATE_FORMATS[unit]}', ${field}${getTimezoneModifier(field, timezone)})`;
-  }
+  return `strftime('${SQLITE_DATE_FORMATS[unit]}', ${field}${getTimezoneModifier(field, timezone)})`;
+}
 
-  return `strftime('${SQLITE_DATE_FORMATS_UTC[unit]}', ${field})`;
+// PG: to_char(field at time zone tz, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'); 'utc' and
+// 'second' are the same format.
+function getDateStringSQL(field: string, _unit: 'utc' | 'second' = 'utc', timezone?: string) {
+  return `strftime('%Y-%m-%dT%H:%M:%SZ', ${field}${getTimezoneModifier(field, timezone)})`;
 }
 
 // PG: concat(extract(dow ...), ':', to_char(..., 'HH24')), e.g. '0:09'.
@@ -758,7 +833,8 @@ function getFilterQuery(filters: Record<string, any>, options: QueryOptions = {}
 
         if (name === 'referrer') {
           andClauses.push(
-            `and (website_event.referrer_domain != replace(website_event.hostname, 'www.', '') or website_event.referrer_domain is null)`,
+            // PG: regexp_replace(website_event.hostname, '^www.', '')
+            `and (website_event.referrer_domain != case when substr(website_event.hostname, 1, 3) = 'www' and length(website_event.hostname) > 3 then substr(website_event.hostname, 5) else website_event.hostname end or website_event.referrer_domain is null)`,
           );
         }
       }
@@ -805,13 +881,17 @@ function getExcludeBounceQuery(filters: Record<string, any>) {
   }
 
   return `join
-    (select distinct session_id, visit_id
+    (select session_id, visit_id
     from website_event
     where website_id = {{websiteId}}
       and created_at between {{startDate}} and {{endDate}}
-      and event_type = 1
+      and event_type != 5
     group by session_id, visit_id
-    having count(*) > 1
+    having sum(case when event_type NOT IN (2, 5) then 1 else 0 end) > 1
+      or (
+        sum(case when event_type NOT IN (2, 5) then 1 else 0 end) = 1
+        and sum(case when event_type = 2 then 1 else 0 end) > 0
+      )
     ) excludeBounce
     on excludeBounce.session_id = website_event.session_id
       and excludeBounce.visit_id = website_event.visit_id
@@ -856,6 +936,169 @@ function getQueryParams(filters: Record<string, any>) {
   };
 }
 
+// One property filter as a SQLite condition on event_data/session_data
+// columns, or undefined to skip it (as PG does for empty values). Same params
+// as PG; arrays bind as JSON (see bindable).
+function getPropertyCondition(
+  { dataType, operator, value }: PropertyFilter,
+  valParam: string,
+  params: Record<string, any>,
+  timezone?: string,
+): string | undefined {
+  const val = `{{${valParam}}}`;
+
+  switch (dataType) {
+    case DATA_TYPE.number: {
+      const col = 'CAST(number_value AS REAL)';
+      params[valParam] = parseFloat(value) || 0;
+      const ops: Record<string, string> = {
+        [OPERATORS.notEquals]: '!=',
+        [OPERATORS.greaterThan]: '>',
+        [OPERATORS.lessThan]: '<',
+        [OPERATORS.greaterThanEquals]: '>=',
+        [OPERATORS.lessThanEquals]: '<=',
+      };
+      return `${col} ${ops[operator] ?? '='} ${val}`;
+    }
+    case DATA_TYPE.date: {
+      if (!value) return;
+      params[valParam] = value;
+      const col = `date(date_value${getTimezoneModifier('date_value', timezone)})`;
+      const op = operator === OPERATORS.before ? '<' : operator === OPERATORS.after ? '>' : '=';
+      return `${col} ${op} date(${val})`;
+    }
+    case DATA_TYPE.array: {
+      if (!value) return;
+      params[valParam] = value;
+      // PG's ::jsonb cast fails the query on a malformed value; skip the row
+      // instead. Elements compare as jsonb_array_elements_text would render
+      // them: json_each's `value` is REAL for 1.50 and 1 for true.
+      const exists = `exists (
+                select 1
+                from json_each(case when json_valid(string_value) then string_value else '[]' end) as item
+                where (case item.type when 'text' then item.value when 'null' then null
+                  else string_value -> item.fullkey end) = ${val}
+              )`;
+      return operator === OPERATORS.contains ? exists : `not ${exists}`;
+    }
+    default: {
+      if (operator === OPERATORS.equals || operator === OPERATORS.notEquals) {
+        const vals = value.split(',').filter(Boolean);
+        if (!vals.length) return;
+        params[valParam] = vals;
+        return `string_value ${operator === OPERATORS.equals ? 'IN' : 'NOT IN'} (SELECT value FROM json_each(${val}))`;
+      }
+      if (operator === OPERATORS.regex || operator === OPERATORS.notRegex) {
+        throw new Error(`D1 does not support regex operator: ${operator}`);
+      }
+      if (!value) return;
+      params[valParam] = `%${value}%`;
+      return `string_value ${operator === OPERATORS.contains ? 'LIKE' : 'NOT LIKE'} ${val} COLLATE NOCASE`;
+    }
+  }
+}
+
+function getPropertyFilterQuery(
+  filters: PropertyFilter[] = [],
+  propertyType: 'event' | 'session' = 'event',
+  timezone?: string,
+): { sql: string; params: Record<string, any> } {
+  const parts: string[] = [];
+  const params: Record<string, any> = {};
+
+  filters.forEach((filter, i) => {
+    const keyParam = `pf_key_${i}`;
+    const condition = getPropertyCondition(filter, `pf_val_${i}`, params, timezone);
+    if (!condition) return;
+    params[keyParam] = filter.propertyName;
+
+    const match = `data_key = {{${keyParam}}}
+        and data_type = ${Number(filter.dataType)}
+        and ${condition}`;
+
+    parts.push(
+      propertyType === 'session'
+        ? `and exists (
+      select 1
+      from session_data
+      where website_id = website_event.website_id
+        and session_id = website_event.session_id
+        and ${match}
+    )`
+        : `and website_event.event_id in (
+      select website_event_id
+      from event_data
+      where website_id = {{websiteId}}
+        and created_at between {{startDate}} and {{endDate}}
+        and ${match}
+    )`,
+    );
+  });
+
+  return { sql: parts.join('\n'), params };
+}
+
+// PG groups the property rows and requires bool_or(match) per filter; SQLite
+// has no bool_or, so each filter is max(case when match then 1 else 0 end) = 1.
+function getGroupedPropertyFilterQuery(
+  filters: PropertyFilter[] = [],
+  prefix: 'epf' | 'spf',
+  timezone?: string,
+): { clauses: string[]; keyRefs: string[]; params: Record<string, any> } {
+  const clauses: string[] = [];
+  const keyRefs: string[] = [];
+  const params: Record<string, any> = {};
+
+  filters.forEach((filter, i) => {
+    const keyParam = `${prefix}_key_${i}`;
+    params[keyParam] = filter.propertyName;
+    keyRefs.push(`{{${keyParam}}}`);
+    const condition = getPropertyCondition(filter, `${prefix}_val_${i}`, params, timezone);
+    if (!condition) return;
+    clauses.push(
+      `max(case when data_key = {{${keyParam}}} and data_type = ${Number(filter.dataType)} and ${condition} then 1 else 0 end) = 1`,
+    );
+  });
+
+  return { clauses, keyRefs, params };
+}
+
+function getEventPropertyFilterQuery(filters: PropertyFilter[] = [], timezone?: string) {
+  const { clauses, keyRefs, params } = getGroupedPropertyFilterQuery(filters, 'epf', timezone);
+  if (!clauses.length) return { sql: '', params: {} };
+
+  return {
+    sql: `and website_event.event_id in (
+      select website_event_id
+      from event_data
+      where website_id = {{websiteId}}
+        and created_at between {{startDate}} and {{endDate}}
+        and data_key in (${keyRefs.join(', ')})
+      group by website_event_id
+      having ${clauses.join('\n        and ')}
+    )`,
+    params,
+  };
+}
+
+function getSessionPropertyFilterQuery(filters: PropertyFilter[] = [], timezone?: string) {
+  const { clauses, keyRefs, params } = getGroupedPropertyFilterQuery(filters, 'spf', timezone);
+  if (!clauses.length) return { sql: '', params: {} };
+
+  return {
+    sql: `and exists (
+      select 1
+      from session_data
+      where website_id = website_event.website_id
+        and session_id = website_event.session_id
+        and data_key in (${keyRefs.join(', ')})
+      group by website_id, session_id
+      having ${clauses.join('\n        and ')}
+    )`,
+    params,
+  };
+}
+
 function parseFilters(filters: Record<string, any>, options?: QueryOptions) {
   const joinSession = Object.keys(filters).find(key => {
     const baseName = key.replace(/\d+$/, '');
@@ -866,14 +1109,26 @@ function parseFilters(filters: Record<string, any>, options?: QueryOptions) {
     Object.entries(filters).filter(([key]) => key.startsWith('cohort_')),
   );
 
+  const eventProperty = getEventPropertyFilterQuery(filters.eventPropertyFilters, filters.timezone);
+  const sessionProperty = getSessionPropertyFilterQuery(
+    filters.sessionPropertyFilters,
+    filters.timezone,
+  );
+
   return {
     joinSessionQuery:
       options?.joinSession || joinSession
         ? `inner join session on website_event.session_id = session.session_id and website_event.website_id = session.website_id`
         : '',
     dateQuery: getDateQuery(filters),
-    filterQuery: getFilterQuery(filters, options),
-    queryParams: getQueryParams(filters),
+    filterQuery: [getFilterQuery(filters, options), eventProperty.sql, sessionProperty.sql]
+      .filter(Boolean)
+      .join('\n'),
+    queryParams: {
+      ...getQueryParams(filters),
+      ...eventProperty.params,
+      ...sessionProperty.params,
+    },
     cohortQuery: getCohortQuery(cohortFilters),
     excludeBounceQuery: getExcludeBounceQuery(filters),
   };
@@ -931,25 +1186,36 @@ async function pagedRawQuery(
   queryParams: Record<string, any>,
   filters: QueryFilters,
   name?: string,
+  defaultOrderBy?: string,
 ) {
-  const { page = 1, pageSize, orderBy, sortDescending = false } = filters;
+  const { page = 1, pageSize, orderBy, sortDescending = false, maxResults } = filters;
   const size = +pageSize || DEFAULT_PAGE_SIZE;
   const offset = +size * (+page - 1);
   const direction = sortDescending ? 'desc' : 'asc';
 
   const statements = [
-    orderBy && `order by ${orderBy} ${direction}`,
+    orderBy ? `order by ${orderBy} ${direction}` : defaultOrderBy && `order by ${defaultOrderBy}`,
     +size > 0 && `limit ${+size} offset ${offset}`,
   ]
     .filter(n => n)
     .join('\n');
 
-  const countResult = await rawQuery(`select count(*) as num from (${query}) t`, queryParams);
+  const countQuery = maxResults
+    ? `select count(*) as num from (select 1 from (${query}) t limit ${+maxResults}) t2`
+    : `select count(*) as num from (${query}) t`;
+  const countResult = await rawQuery(countQuery, queryParams);
   const count = Number(countResult?.[0]?.num ?? 0);
 
   const data = await rawQuery(`${query}${statements}`, queryParams, name);
 
-  return { data, count, page: +page, pageSize: size, orderBy };
+  return {
+    data,
+    count,
+    page: +page,
+    pageSize: size,
+    orderBy,
+    isCapped: !!maxResults && count >= +maxResults,
+  };
 }
 
 async function pagedQuery<T>(model: string, criteria: T, filters?: QueryFilters): Promise<any> {
@@ -1003,6 +1269,8 @@ const BULK_TABLES = new Set<any>([
   schema.session,
   schema.revenue,
   schema.sessionReplay,
+  schema.heatmapEvent,
+  schema.sessionLink,
 ]);
 const PURGE_CHUNK = 5000;
 
@@ -1029,14 +1297,50 @@ async function runBatch(items: BatchItem[]) {
   });
 }
 
-const TX_WRITES = new Set(['create', 'createMany', 'update', 'updateMany', 'delete', 'deleteMany']);
+const TX_WRITES = new Set([
+  'create',
+  'createMany',
+  'update',
+  'updateMany',
+  'upsert',
+  'delete',
+  'deleteMany',
+]);
+
+// tx.$executeRawUnsafe(): PG SQL with $1-style params. Upstream only sends
+// `DELETE FROM a USING b WHERE …` (deleteWebsite), rewritten to a rowid
+// subquery so SQLite can drive the join from b's index. Anything else runs
+// as-is and fails loudly if it's PG-only.
+function rawWrite(query: string, params: any[]): BatchItem {
+  const text = query
+    .replace(
+      /^\s*delete\s+from\s+(\w+)\s+using\s+(\w+)\s+where\s+([\s\S]*?)\s*;?\s*$/i,
+      'DELETE FROM $1 WHERE rowid IN (SELECT $1.rowid FROM $1, $2 WHERE $3)',
+    )
+    .replace(/\$(\d+)/g, '?$1');
+  return {
+    queries: [],
+    map: () => 0,
+    // A prelude, so it runs in call order with the chunked purges: by the
+    // time the batch runs, deleteWebsite has purged the rows `b` joins on.
+    // ponytail: one statement, not chunked; fine for the few rows it's meant
+    // to catch, slow past D1's 30 s on a site with tens of millions of events.
+    prelude: async () => {
+      const stmt = (db as any).$client.prepare(text);
+      await (params.length ? stmt.bind(...params.map(bindable)) : stmt).run();
+    },
+  };
+}
 
 // Prisma's $transaction on D1. Both forms become a single db.batch(), which
 // D1 runs atomically. The callback form records writes rather than running
-// them: reads inside it throw, nothing commits until the callback returns
-// (side effects in it run first), and an awaited write's result is a
-// placeholder that throws if used. Only the write the callback returns
-// resolves to its real row.
+// them: nothing commits until the callback returns (side effects in it run
+// first), and an awaited write's result is a placeholder that throws if
+// used. Only the write the callback returns resolves to its real row. Reads
+// need their result, so they run immediately, which is only consistent
+// before the first recorded write; after one they throw. An upsert before
+// any other write also runs immediately (2FA's rate limit reads its row);
+// after one it's batched like other writes.
 async function transaction(input: any, _options?: any): Promise<any> {
   if (Array.isArray(input)) {
     return runBatch(
@@ -1050,9 +1354,26 @@ async function transaction(input: any, _options?: any): Promise<any> {
   const recorded: BatchItem[] = [];
   const placeholders = new Map<any, number>();
   const tx = new Proxy({} as any, {
-    get: (_, model: string) =>
-      new Proxy({} as any, {
+    get: (_, model: string) => {
+      if (model === '$executeRawUnsafe') {
+        return (query: string, ...params: any[]) => {
+          recorded.push(rawWrite(query, params));
+          return Promise.resolve(0);
+        };
+      }
+      return new Proxy({} as any, {
         get: (_, op: string) => (args: any) => {
+          const immediate =
+            op === 'upsert' ? !recorded.length : !TX_WRITES.has(op) && client[model][op];
+          if (immediate) {
+            if (recorded.length) {
+              throw new Error(
+                `drizzle-compat: tx.${model}.${op}() after a write isn't supported in a D1 ` +
+                  "transaction (it can't see the pending writes)",
+              );
+            }
+            return client[model][op](args);
+          }
           const item = TX_WRITES.has(op) && client[model][op](args)[BATCH];
           if (!item) {
             throw new Error(
@@ -1075,7 +1396,8 @@ async function transaction(input: any, _options?: any): Promise<any> {
           placeholders.set(placeholder, recorded.push(item) - 1);
           return Promise.resolve(placeholder);
         },
-      }),
+      });
+    },
   });
 
   const ret = await input(tx);
@@ -1091,8 +1413,12 @@ export default {
   getCastColumnQuery,
   getDayDiffQuery,
   getDateSQL,
+  getDateStringSQL,
   getDateWeeklySQL,
   getFilterQuery,
+  getPropertyFilterQuery,
+  // D1 has no schemas; src/lib/prisma.ts's named getSchema() defers to this.
+  getSchema: (): string | null => null,
   getSearchParameters,
   getTimestampDiffSQL,
   getSearchSQL,
@@ -1100,4 +1426,6 @@ export default {
   pagedRawQuery,
   parseFilters,
   rawQuery,
+  // D1 has one primary; reads and writes go to it.
+  writeRawQuery: rawQuery,
 };

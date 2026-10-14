@@ -1,9 +1,12 @@
 import { DEFAULT_RESET_DATE } from '@/lib/constants';
 import prisma from '@/lib/prisma';
+import type { WebsiteDateRange } from '@/lib/types';
 
 // min() and max() in one SELECT defeat SQLite's min/max optimization and scan
 // every row in range; as separate subqueries each is a single index seek.
-export async function sqliteGetWebsiteDateRange(websiteId: string) {
+export async function sqliteGetWebsiteDateRange(
+  websiteId: string,
+): Promise<WebsiteDateRange | null> {
   const { rawQuery, parseFilters } = prisma;
   const { queryParams } = parseFilters({
     startDate: new Date(DEFAULT_RESET_DATE),

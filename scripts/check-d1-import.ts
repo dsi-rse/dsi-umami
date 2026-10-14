@@ -133,35 +133,73 @@ assert.equal(all(`SELECT username FROM "user" WHERE user_id = 'u1'`)[0].username
 assert.throws(() => db.exec(userSql([user('u3', 'ann2')], false)), /UNIQUE/);
 db.exec(userSql([user('u1', 'ann')]));
 assert.deepEqual(all('SELECT user_id FROM "user"'), [{ user_id: 'u1' }]);
+// Usernames from a source before upstream's lowercase migration: the import re-runs D1's.
+db.exec(userSql([user('u1', 'Ann'), user('u2', 'BOB')]));
+db.exec(readFileSync(`${dir}/0008_lowercase_username.sql`, 'utf8'));
+assert.deepEqual(all('SELECT username FROM "user" ORDER BY 1'), [
+  { username: 'ann' },
+  { username: 'bob' },
+]);
 
-// session_data keeps the latest row per (session_id, data_key): a rewritten row replaces the
-// copy with the old id, and an older row never displaces a newer one.
+// session_data keeps the latest row per (session_id, data_key), its unique key: a rewritten row
+// replaces the copy with the old id, and an older row never displaces a newer one.
 const sdCols = [
   'session_data_id',
   'website_id',
   'session_id',
   'data_key',
+  'string_value',
   'data_type',
   'created_at',
 ];
-const sd = (id: string, key: string, at: string) => ({
+const sd = (id: string, key: string, at: string | null, value = 'x') => ({
   session_data_id: id,
   website_id: 'w1',
   session_id: 's1',
   data_key: key,
+  string_value: value,
   data_type: 1,
-  created_at: `2026-01-0${at}T00:00:00.000Z`,
+  created_at: at && `2026-01-0${at}T00:00:00.000Z`,
 });
 const sdSql = (rows: Record<string, unknown>[]) =>
   buildStatements('session_data', sdCols, D1_TABLES.session_data.pk, rows, {
     latestPer: ['session_id', 'data_key'],
   }).join('');
+const sdRows = () =>
+  all('SELECT session_data_id, data_key, string_value FROM session_data ORDER BY 2');
 db.exec(sdSql([sd('old', 'plan', '1'), sd('k2', 'other', '1')]));
 db.exec(sdSql([sd('new', 'plan', '2')]));
 db.exec(sdSql([sd('older', 'plan', '1')]));
-assert.deepEqual(all('SELECT session_data_id FROM session_data ORDER BY 1'), [
-  { session_data_id: 'k2' },
-  { session_data_id: 'new' },
+db.exec(sdSql([sd('new', 'plan', '2')])); // re-applied: same pk and key
+assert.deepEqual(sdRows(), [
+  { session_data_id: 'k2', data_key: 'other', string_value: 'x' },
+  { session_data_id: 'new', data_key: 'plan', string_value: 'x' },
 ]);
+// Duplicates within one batch (a source before upstream's session_data dedupe; NULL is
+// oldest), and a row rewritten in place with the same id and created_at.
+db.exec(
+  sdSql([sd('n1', 'dup', null), sd('d1', 'dup', '1'), sd('d2', 'dup', '2'), sd('d0', 'dup', null)]),
+);
+db.exec(sdSql([sd('k2', 'other', '1', 'y')]));
+assert.deepEqual(sdRows(), [
+  { session_data_id: 'd2', data_key: 'dup', string_value: 'x' },
+  { session_data_id: 'k2', data_key: 'other', string_value: 'y' },
+  { session_data_id: 'new', data_key: 'plan', string_value: 'x' },
+]);
+
+// Composite primary key (session_link) is the conflict target.
+assert.deepEqual(D1_TABLES.session_link.pk, ['website_id', 'distinct_id', 'session_id']);
+const link = {
+  website_id: 'w1',
+  session_id: 's1',
+  distinct_id: 'd1',
+  created_at: when.toISOString(),
+};
+const linkSql = buildStatements('session_link', Object.keys(link), D1_TABLES.session_link.pk, [
+  link,
+]).join('');
+db.exec(linkSql);
+db.exec(linkSql);
+assert.equal(all('SELECT count(*) AS n FROM session_link')[0].n, 1);
 
 console.log('d1 import SQL: OK');

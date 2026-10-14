@@ -10,13 +10,20 @@
  * re-applies everything; rows already in D1 are no-op upserts.
  *
  * Two kinds of table:
- *   - mutable (user, team, team_user, website, report, segment, link, pixel, board, share,
- *     session_replay_saved): small, edited in place. Every run mirrors them with
- *     `DELETE FROM` + full copy, so deletions (revoked members, removed share links) reach D1.
- *   - append-only (session, website_event, event_data, session_data, revenue, session_replay):
- *     large. --since copies only rows with created_at >= since. Rows deleted from these in
- *     Supabase after an earlier run (website reset/delete) stay in D1; a full run's
- *     validation reports them as D1 being ahead of the source.
+ *   - mutable (user, api_key, two_factor_*, app_setting, team, team_user, website, report,
+ *     segment, annotation, link, pixel, board, share, session_replay_saved): small, edited in
+ *     place. Every run mirrors them with `DELETE FROM` + full copy, so deletions (revoked
+ *     members, removed share links, revoked API keys) reach D1.
+ *   - append-only (session, session_link, website_event, event_data, session_data, revenue,
+ *     session_replay, heatmap_event): large. --since copies only rows with created_at >= since.
+ *     Rows deleted from these in Supabase after an earlier run (website reset/delete) stay in
+ *     D1; a full run's validation reports them as D1 being ahead of the source.
+ *
+ * The source may still be on an older upstream schema. Tables it doesn't have yet are skipped
+ * (D1 keeps them empty), columns it doesn't have get D1's defaults, and LEGACY_COLUMNS reads
+ * renamed columns under their new names. Data changes of the D1 migrations that ran before
+ * the import are repeated on the copy: session_data is deduplicated by its upsert key, and
+ * 0008_lowercase_username runs again after `user` is copied.
  *
  * Cutover:
  *   1. Ahead of time, a full run:          --target=remote
@@ -116,22 +123,34 @@ function parseArgs(): Args {
 
 // appendOnly: large insert-only logs that --since narrows by created_at. The rest are small and
 // edited in place, so every run mirrors them whole. Parents first (D1 has no FK constraints, but
-// a partly applied run stays readable).
-type TableSpec = { name: string; appendOnly?: boolean; latestPer?: string[] };
+// a partly applied run stays readable). `after`: a D1 SQL file run once the table is copied.
+// The two_factor_* tables hold short-lived state too (OTP replay window, lockouts); mirroring
+// them keeps a lockout in force across the cutover.
+type TableSpec = { name: string; appendOnly?: boolean; latestPer?: string[]; after?: string };
 const TABLES: TableSpec[] = [
-  { name: 'user' },
+  // Usernames from a source that predates upstream's 24_lowercase_username still have
+  // capitals, and logins look up the lowercased name. The file is idempotent.
+  { name: 'user', after: 'prisma/migrations-d1/0008_lowercase_username.sql' },
+  { name: 'api_key' },
+  { name: 'two_factor_auth' },
+  { name: 'two_factor_backup_code' },
+  { name: 'two_factor_otp_used' },
+  { name: 'two_factor_rate_limit' },
+  { name: 'app_setting' },
   { name: 'team' },
   { name: 'team_user' },
   { name: 'website' },
   { name: 'session', appendOnly: true },
+  { name: 'session_link', appendOnly: true },
   { name: 'website_event', appendOnly: true },
   { name: 'event_data', appendOnly: true },
-  // saveSessionData rewrites a (session_id, data_key) row with a fresh session_data_id and
-  // created_at, so D1 keeps only the latest row per key: drops the id an earlier run copied,
-  // and after the flip never lets an older Supabase row displace a newer D1-native one.
+  // One row per (session_id, data_key), D1's unique key: the newest wins, whether the source
+  // still has duplicates (before upstream's 23_update_session_data) or a row was rewritten,
+  // and after the flip an older Supabase row never displaces a newer D1-native one.
   { name: 'session_data', appendOnly: true, latestPer: ['session_id', 'data_key'] },
   { name: 'report' },
   { name: 'segment' },
+  { name: 'annotation' },
   { name: 'revenue', appendOnly: true },
   { name: 'link' },
   { name: 'pixel' },
@@ -139,12 +158,31 @@ const TABLES: TableSpec[] = [
   { name: 'share' },
   { name: 'session_replay', appendOnly: true },
   { name: 'session_replay_saved' },
+  { name: 'heatmap_event', appendOnly: true },
 ];
 
 // Older umami forks may predate later upstream tables (segment, revenue, link, pixel, board,
-// share, session_replay*), which then stay empty in D1. Missing one of these means the wrong
-// database.
+// share, session_replay*, heatmap_event, session_link, two_factor_*, app_setting, annotation,
+// api_key), which then stay empty in D1. Missing one of these means the wrong database.
 const CORE_TABLES = new Set(['user', 'website', 'session', 'website_event']);
+
+// Source columns that a later upstream migration renamed, for sources that haven't run it:
+// read `from` as `to`, with `select` giving the source SQL for the affected D1 columns, the
+// same transform the migration applies.
+const LEGACY_COLUMNS: Record<string, { from: string; to: string; select: Record<string, string> }> =
+  {
+    // 20_add_heatmap (D1 0004): the flag moved into replay_config.replayEnabled.
+    website: {
+      from: 'replay_enabled',
+      to: 'recorder_enabled',
+      select: {
+        recorder_enabled: '"replay_enabled"',
+        replay_config:
+          `CASE WHEN "replay_enabled" THEN COALESCE("replay_config", '{}'::jsonb)` +
+          ` || '{"replayEnabled": true}'::jsonb ELSE "replay_config" END`,
+      },
+    },
+  };
 
 const FETCH_ROWS = 500; // rows per cursor FETCH, and per .sql file
 // D1 rejects any single statement over 100 KB (SQLITE_TOOBIG). Statements are packed by UTF-8
@@ -284,8 +322,9 @@ async function copyTable(pg: Client, spec: TableSpec, args: Args, dropped: strin
   const wipe = !spec.appendOnly;
   // created_at first so rows land in D1 in time order, which is how reports range-scan them.
   const order = [...(spec.appendOnly ? ['created_at'] : []), ...pk].map(quoteIdent).join(', ');
+  const select = cols.map(c => (c.select ? `${c.select} AS ` : '') + quoteIdent(c.name));
   await pg.query(
-    `DECLARE migrate_cursor CURSOR FOR SELECT ${names.map(quoteIdent).join(', ')}` +
+    `DECLARE migrate_cursor CURSOR FOR SELECT ${select.join(', ')}` +
       ` FROM ${quoteIdent(spec.name)}${sinceFilter(since)} ORDER BY ${order}`,
   );
 
@@ -312,11 +351,13 @@ async function copyTable(pg: Client, spec: TableSpec, args: Args, dropped: strin
   await pg.query('CLOSE migrate_cursor');
   // Empty in the source: D1 still has to be emptied to match.
   if (wipe && !files.length) write(buildStatements(spec.name, names, pk, [], { wipe }));
+  if (spec.after) write([readFileSync(spec.after, 'utf8')]);
   console.log(`  ${written} rows written, ${files.length} batch file(s)`);
   return files;
 }
 
-type ColumnInfo = { name: string; type: string };
+// `select`: source SQL read under this name, for LEGACY_COLUMNS.
+type ColumnInfo = { name: string; type: string; select?: string };
 
 async function getColumns(
   pg: Client,
@@ -332,8 +373,19 @@ async function getColumns(
     [table],
   );
   const d1 = D1_TABLES[table].columns;
+  const legacy = LEGACY_COLUMNS[table];
+  const renamed =
+    legacy &&
+    rows.some(r => r.column_name === legacy.from) &&
+    !rows.some(r => r.column_name === legacy.to);
+  const cols: ColumnInfo[] = rows.map(r => {
+    if (!renamed) return { name: r.column_name, type: r.data_type };
+    const name = r.column_name === legacy.from ? legacy.to : r.column_name;
+    return { name, type: r.data_type, select: legacy.select[name] };
+  });
+  if (renamed) console.log(`  reading ${table}.${legacy.from} as ${legacy.to}`);
   // A source column D1 has no place for would otherwise vanish with only a log line.
-  const extra = rows.filter(r => !d1.has(r.column_name)).map(r => `${table}.${r.column_name}`);
+  const extra = cols.filter(c => !d1.has(c.name)).map(c => `${table}.${c.name}`);
   const refused = extra.filter(c => !allowDrop.has(c));
   if (refused.length) {
     throw new Error(
@@ -342,9 +394,7 @@ async function getColumns(
     );
   }
   dropped.push(...extra);
-  return rows
-    .filter(r => d1.has(r.column_name))
-    .map(r => ({ name: r.column_name, type: r.data_type }));
+  return cols.filter(c => d1.has(c.name));
 }
 
 function transformRow(row: any, cols: ColumnInfo[]): Record<string, any> {
@@ -380,8 +430,9 @@ export function transformValue(v: any, type: string): any {
  * Packs rows into `INSERT ... ON CONFLICT (pk) DO UPDATE` statements of at most `budget` bytes.
  * Unlike INSERT OR REPLACE, a pk upsert never deletes a different row that merely shares a
  * unique value (username, slug, access_code), and never resets columns absent from the source.
- * `wipe` prepends `DELETE FROM` (first batch of a mirrored table). `latestPer` follows each
- * INSERT with a DELETE keeping only the newest row (by created_at, then pk) per key it touched.
+ * `wipe` prepends `DELETE FROM` (first batch of a mirrored table). `latestPer` names a unique key
+ * to upsert on instead of the pk: a row replaces the one holding its key (pk included) only if
+ * it is at least as new, by created_at (NULL oldest) then pk.
  */
 export function buildStatements(
   table: string,
@@ -395,38 +446,28 @@ export function buildStatements(
   }: { budget?: number; wipe?: boolean; latestPer?: string[] } = {},
 ): string[] {
   const t = quoteIdent(table);
-  const q = (cols: string[], prefix = '') => cols.map(c => prefix + quoteIdent(c)).join(', ');
+  const q = (cols: string[]) => cols.map(quoteIdent).join(', ');
   const tuple = (r: Record<string, unknown>, cols: string[]) =>
     `(${cols.map(c => sqlLit(r[c])).join(', ')})`;
+  const target = latestPer ?? pk;
   const updates = columns
-    .filter(c => !pk.includes(c))
+    .filter(c => !target.includes(c))
     .map(c => `${quoteIdent(c)} = excluded.${quoteIdent(c)}`);
+  const recency = (prefix: string) =>
+    ['created_at', ...pk].map(c => `coalesce(${prefix}${quoteIdent(c)}, '')`).join(', ');
+  const newer = latestPer ? ` WHERE (${recency('excluded.')}) >= (${recency(`${t}.`)})` : '';
   const head = `INSERT INTO ${t} (${q(columns)}) VALUES\n`;
   const tail =
-    `\nON CONFLICT (${q(pk)}) DO ` +
-    `${updates.length ? `UPDATE SET ${updates.join(', ')}` : 'NOTHING'};\n`;
+    `\nON CONFLICT (${q(target)}) DO ` +
+    `${updates.length ? `UPDATE SET ${updates.join(', ')}${newer}` : 'NOTHING'};\n`;
   const fixed = Buffer.byteLength(head + tail);
 
   const out = wipe ? [`DELETE FROM ${t};\n`] : [];
-  let chunk: Record<string, unknown>[] = [];
   let tuples: string[] = [];
   let size = fixed;
   const flush = () => {
     if (!tuples.length) return;
     out.push(head + tuples.join(',\n') + tail);
-    if (latestPer) {
-      const order = ['created_at', ...pk];
-      const sameKey = latestPer.map(c => `"n".${quoteIdent(c)} = ${t}.${quoteIdent(c)}`);
-      const del =
-        `DELETE FROM ${t} WHERE (${q(latestPer)}) IN ` +
-        `(VALUES ${chunk.map(r => tuple(r, latestPer)).join(', ')}) AND EXISTS (` +
-        `SELECT 1 FROM ${t} AS "n" WHERE ${sameKey.join(' AND ')}` +
-        ` AND (${q(order, '"n".')}) > (${q(order, `${t}.`)}));\n`;
-      // Carries a subset of each row's values, so it is smaller than the INSERT it follows.
-      if (Buffer.byteLength(del) > budget) throw new Error(`${table}: dedupe statement too big`);
-      out.push(del);
-    }
-    chunk = [];
     tuples = [];
     size = fixed;
   };
@@ -441,7 +482,6 @@ export function buildStatements(
       );
     }
     if (size + bytes > budget) flush();
-    chunk.push(r);
     tuples.push(values);
     size += bytes;
   }

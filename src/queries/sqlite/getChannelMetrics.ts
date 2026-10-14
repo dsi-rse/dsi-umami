@@ -1,5 +1,6 @@
 import {
   EMAIL_DOMAINS,
+  LLM_DOMAINS,
   PAID_AD_PARAMS,
   SEARCH_DOMAINS,
   SHOPPING_DOMAINS,
@@ -8,9 +9,26 @@ import {
 } from '@/lib/constants';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
-import { toSqliteLikeClause } from '@/queries/sqlite/_helpers';
 
 const FUNCTION_NAME = 'getChannelMetrics';
+
+// PG regexp_replace(hostname, '^www.', ''): strip "www" plus any one character,
+// only at the start.
+export const SQLITE_STRIP_WWW_HOSTNAME =
+  "(case when substr(hostname, 1, 3) = 'www' and length(hostname) > 3 then substr(hostname, 5) else hostname end)";
+
+// Same as upstream's escapePostgresLikeValue: the constants are matched
+// literally (PAID_AD_PARAMS has underscores). SQLite LIKE has no default
+// escape character, so each clause names one.
+function escapeSqliteLikeValue(val: string) {
+  return val.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_').replace(/'/g, "''");
+}
+
+export function toSqliteLikeClause(column: string, arr: string[]) {
+  return arr
+    .map(val => `${column} LIKE '%${escapeSqliteLikeValue(val)}%' ESCAPE '\\'`)
+    .join(' OR\n  ');
+}
 
 export async function sqliteGetChannelMetrics(websiteId: string, filters: QueryFilters) {
   const { rawQuery, parseFilters } = prisma;
@@ -32,6 +50,9 @@ export async function sqliteGetChannelMetrics(websiteId: string, filters: QueryF
           website_event.utm_medium,
           website_event.utm_source,
           website_event.session_id,
+          website_event.visit_id,
+          website_event.event_id,
+          website_event.created_at,
           website_event.hostname
       from website_event
       ${cohortQuery}
@@ -49,21 +70,40 @@ export async function sqliteGetChannelMetrics(websiteId: string, filters: QueryF
           when ${toSqliteLikeClause('utm_medium', ['referral', 'app', 'link'])} then 'referral'
           when utm_medium LIKE '%affiliate%' then 'affiliate'
           when utm_medium LIKE '%sms%' or utm_source LIKE '%sms%' then 'sms'
+          when ${toSqliteLikeClause('referrer_domain', LLM_DOMAINS)} then 'llm'
           when ${toSqliteLikeClause('referrer_domain', SEARCH_DOMAINS)} or utm_medium LIKE '%organic%' then concat(prefix, 'Search')
           when ${toSqliteLikeClause('referrer_domain', SOCIAL_DOMAINS)} then concat(prefix, 'Social')
           when ${toSqliteLikeClause('referrer_domain', EMAIL_DOMAINS)} or utm_medium LIKE '%mail%' then 'email'
           when ${toSqliteLikeClause('referrer_domain', SHOPPING_DOMAINS)} or utm_medium LIKE '%shop%' then concat(prefix, 'Shopping')
           when ${toSqliteLikeClause('referrer_domain', VIDEO_DOMAINS)} or utm_medium LIKE '%video%' then concat(prefix, 'Video')
-          when referrer_domain != replace(hostname, 'www.', '') and referrer_domain != '' then 'referral'
+          when referrer_domain != ${SQLITE_STRIP_WWW_HOSTNAME} and referrer_domain != '' then 'referral'
           else '' end AS x,
-        count(distinct session_id) y
-      from prefix
-      group by 1
-      order by y desc)
+          session_id,
+          visit_id,
+          event_id,
+          created_at
+      from prefix),
 
-    select x, sum(y) y
-    from channels
-    where x != ''
+    visit_channels as (
+      select
+        session_id,
+        visit_id,
+        coalesce(nullif(x, ''), 'direct') as x
+      from (
+        select
+          x,
+          session_id,
+          visit_id,
+          row_number() over (
+            partition by session_id, visit_id
+            order by case when x != '' then 0 else 1 end, created_at, event_id
+          ) as row_num
+        from channels
+      ) as ranked_channels
+      where row_num = 1)
+
+    select x, count(distinct session_id) y
+    from visit_channels
     group by x
     order by y desc;
     `,

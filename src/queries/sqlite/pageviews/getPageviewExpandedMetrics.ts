@@ -15,8 +15,8 @@ export async function sqliteGetPageviewExpandedMetrics(
   filters: QueryFilters,
 ): Promise<PageviewExpandedMetricsData[]> {
   const { type, limit = 500, offset = 0 } = parameters;
-  let column = FILTER_COLUMNS[type] || type;
-  const { rawQuery, parseFilters, getTimestampDiffSQL } = prisma;
+  let column = getPageviewColumn(type);
+  const { rawQuery, parseFilters } = prisma;
   const { filterQuery, joinSessionQuery, cohortQuery, excludeBounceQuery, queryParams } =
     parseFilters(
       {
@@ -25,12 +25,18 @@ export async function sqliteGetPageviewExpandedMetrics(
       },
       { joinSession: SESSION_COLUMNS.includes(type) },
     );
+  const fullPathSearchQuery =
+    type === 'fullPath' && filters.search ? `and (${FULL_PATH_SQL}) LIKE {{fullPathSearch}}` : '';
 
   let entryExitQuery = '';
   let excludeDomain = '';
 
   if (column === 'referrer_domain') {
-    excludeDomain = `and website_event.referrer_domain != replace(website_event.hostname, 'www.', '')
+    // PG: regexp_replace(website_event.hostname, '^www.', '').
+    excludeDomain = `and website_event.referrer_domain != (case
+        when substr(website_event.hostname, 1, 3) = 'www' and length(website_event.hostname) > 3
+        then substr(website_event.hostname, 5)
+        else website_event.hostname end)
       and website_event.referrer_domain != ''`;
     if (type === 'domain') {
       column = toSqliteGroupedReferrer(GROUPED_DOMAINS);
@@ -55,6 +61,9 @@ export async function sqliteGetPageviewExpandedMetrics(
     `;
   }
 
+  const selectColumn = type === 'fullPath' ? FULL_PATH_SQL : column;
+  const groupByColumn = type === 'fullPath' ? FULL_PATH_SQL : column;
+
   return rawQuery(
     `
     select
@@ -62,16 +71,14 @@ export async function sqliteGetPageviewExpandedMetrics(
       sum(t.c) as "pageviews",
       count(distinct t.session_id) as "visitors",
       count(distinct t.visit_id) as "visits",
-      sum(case when t.c = 1 then 1 else 0 end) as "bounces",
-      sum(${getTimestampDiffSQL('t.min_time', 't.max_time')}) as "totaltime"
+      0 as "bounces",
+      0 as "totaltime"
     from (
       select
-        ${column} as "name",
+        ${selectColumn} as "name",
         website_event.session_id,
         website_event.visit_id,
-        count(*) as "c",
-        min(website_event.created_at) as "min_time",
-        max(website_event.created_at) as "max_time"
+        count(*) as "c"
       from website_event
       ${cohortQuery}
       ${excludeBounceQuery}
@@ -81,8 +88,9 @@ export async function sqliteGetPageviewExpandedMetrics(
       and website_event.created_at between {{startDate}} and {{endDate}}
       and website_event.event_type NOT IN (2, 5)
         ${excludeDomain}
+        ${fullPathSearchQuery}
         ${filterQuery}
-      group by ${column}, website_event.session_id, website_event.visit_id
+      group by ${groupByColumn}, website_event.session_id, website_event.visit_id
     ) as t
     where name != ''
     group by name
@@ -90,9 +98,22 @@ export async function sqliteGetPageviewExpandedMetrics(
     limit ${limit}
     offset ${offset}
     `,
-    queryParams,
+    {
+      ...queryParams,
+      ...(type === 'fullPath' && filters.search ? { fullPathSearch: `%${filters.search}%` } : {}),
+    },
     FUNCTION_NAME,
   );
+}
+
+const FULL_PATH_SQL = `case when website_event.url_query != '' then website_event.url_path || '?' || website_event.url_query else website_event.url_path end`;
+
+function getPageviewColumn(type: string) {
+  if (type === 'fullPath') {
+    return 'url_path';
+  }
+
+  return FILTER_COLUMNS[type] || type;
 }
 
 export default sqliteGetPageviewExpandedMetrics;

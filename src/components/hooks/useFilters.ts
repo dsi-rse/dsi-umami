@@ -1,6 +1,7 @@
 import { FILTER_COLUMNS, OPERATORS } from '@/lib/constants';
+import { parseSessionPropertyFilters, parseUniversalEventPropertyFilters } from '@/lib/params';
 import { safeDecodeURIComponent } from '@/lib/url';
-import { useConfig } from './useConfig';
+import { useShare } from './context/useShare';
 import { useFields } from './useFields';
 import { useMessages } from './useMessages';
 import { useNavigation } from './useNavigation';
@@ -8,10 +9,11 @@ import { useOperatorLabels } from './useOperatorLabels';
 
 export function useFilters() {
   const { t, labels } = useMessages();
-  const { query } = useNavigation();
+  const { pathname, query } = useNavigation();
   const { fields } = useFields();
   const operatorLabels = useOperatorLabels();
-  const config = useConfig();
+  const share = useShare();
+  const allowFilter = share?.parameters?.allowFilter !== false;
 
   const operators = [
     { name: 'eq', type: 'string', label: t(labels.is) },
@@ -33,7 +35,10 @@ export function useFilters() {
     { name: 'bf', type: 'date', label: t(labels.before) },
     { name: 'af', type: 'date', label: t(labels.after) },
     { name: 'eq', type: 'uuid', label: t(labels.is) },
-  ].filter(({ name }) => !config?.regexFiltersDisabled || (name !== 're' && name !== 'nre'));
+    // D1 has no regex (see D1_FORK.md); set at build time by the cf:* scripts.
+  ].filter(
+    f => process.env.NEXT_PUBLIC_DATABASE_FLAVOR !== 'd1' || !['re', 'nre'].includes(f.name),
+  );
 
   const typeFilters = {
     string: [
@@ -58,30 +63,35 @@ export function useFilters() {
     uuid: [OPERATORS.equals],
   };
 
-  const filters = Object.keys(query).reduce((arr, key) => {
-    const baseName = key.replace(/\d+$/, '');
-    if (FILTER_COLUMNS[baseName]) {
-      let operator = 'eq';
-      let value = safeDecodeURIComponent(query[key]);
-      const label = fields.find(({ name }) => name === baseName)?.label;
+  const filters = allowFilter
+    ? Object.keys(query).reduce((arr, key) => {
+        const baseName = key.replace(/\d+$/, '');
+        if (FILTER_COLUMNS[baseName]) {
+          let operator = 'eq';
+          let value = safeDecodeURIComponent(query[key]);
+          const label = fields.find(({ name }) => name === baseName)?.label;
 
-      const match = value.match(/^([a-z]+)\.(.*)/);
+          const match = value.match(/^([a-z]+)\.(.*)/);
 
-      if (match) {
-        operator = match[1];
-        value = match[2];
-      }
+          if (match) {
+            operator = match[1];
+            value = match[2];
+          }
 
-      return arr.concat({
-        name: key,
-        type: baseName,
-        operator,
-        value,
-        label,
-      });
-    }
-    return arr;
-  }, []);
+          return arr.concat({
+            name: key,
+            type: baseName,
+            operator,
+            value,
+            label,
+          });
+        }
+        return arr;
+      }, [])
+    : [];
+  const eventPropertyFilters =
+    allowFilter && pathname.endsWith('/events') ? parseUniversalEventPropertyFilters(query) : [];
+  const sessionPropertyFilters = allowFilter ? parseSessionPropertyFilters(query) : [];
 
   const getFilters = (type: string) => {
     return (
@@ -93,5 +103,14 @@ export function useFilters() {
     );
   };
 
-  return { fields, operators, filters, operatorLabels, typeFilters, getFilters };
+  return {
+    fields,
+    operators,
+    filters,
+    eventPropertyFilters,
+    sessionPropertyFilters,
+    operatorLabels,
+    typeFilters,
+    getFilters,
+  };
 }
