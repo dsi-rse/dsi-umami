@@ -180,6 +180,7 @@
     "miniflare": "4.20260601.0",
     "msw": "^2.15.0",
     "openapi-typescript": "^7.13.0",
+    "pg": "^8.22.0",
     "postcss": "^8.5.28",
     "postcss-flexbugs-fixes": "^5.0.2",
     "postcss-preset-env": "11.3.2",

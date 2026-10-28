@@ -293,6 +293,9 @@ until you're past the point you'd roll back.
 
 ## After merging upstream
 
+- Upstream CI runs Node 22. On Node 25+, the jsdom tests fail on `localStorage`
+  (Node's own experimental `localStorage` shadows jsdom's); run them with
+  `NODE_OPTIONS=--no-experimental-webstorage pnpm test` or use Node 22.
 - `pnpm generate:db:client` once (generates the Prisma client the checks
   import; upstream renamed it from `build-db-client`), `pnpm build:packages`
   (upstream tests import the workspace packages), then `pnpm check-d1-coverage`,
