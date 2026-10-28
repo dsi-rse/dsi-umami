@@ -11,6 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   buildStatements,
   D1_TABLES,
+  migrateLegacyReports,
   STATEMENT_BYTES,
   sqlLit,
   transformValue,
@@ -201,5 +202,80 @@ const linkSql = buildStatements('session_link', Object.keys(link), D1_TABLES.ses
 db.exec(linkSql);
 db.exec(linkSql);
 assert.equal(all('SELECT count(*) AS n FROM session_link')[0].n, 1);
+
+// 14_add_link_and_pixel replay for pre-14 sources.
+{
+  const base = { user_id: 'u', website_id: 'w', description: '', created_at: null };
+  const out = migrateLegacyReports([
+    {
+      ...base,
+      report_id: 'f1',
+      type: 'funnel',
+      name: 'one step',
+      parameters: '{"steps":[{"type":"url","value":"/"}]}',
+    },
+    {
+      ...base,
+      report_id: 'f2',
+      type: 'funnel',
+      name: 'two steps',
+      parameters: JSON.stringify({
+        websiteId: 'w',
+        dateRange: {},
+        urls: ['/'],
+        window: 60,
+        steps: [
+          { type: 'url', value: '/' },
+          { type: 'event', value: 'signup' },
+        ],
+      }),
+    },
+    {
+      ...base,
+      report_id: 'g1',
+      type: 'goals',
+      name: 'Goals',
+      parameters: JSON.stringify({
+        goals: [
+          { type: 'url', value: '/pricing' },
+          { type: 'event', value: 'signup' },
+          { type: 'event-data', value: 'x' },
+        ],
+      }),
+    },
+    { ...base, report_id: 'r1', type: 'retention', name: 'kept', parameters: '{"a":1}' },
+  ]);
+  assert.deepEqual(
+    out.map(r => [r.type, r.name]),
+    [
+      ['funnel', 'two steps'],
+      ['goal', 'Goals - /pricing'],
+      ['goal', 'Goals - signup'],
+      ['retention', 'kept'],
+    ],
+  );
+  assert.deepEqual(JSON.parse(out[0].parameters), {
+    window: 60,
+    steps: [
+      { type: 'path', value: '/' },
+      { type: 'event', value: 'signup' },
+    ],
+  });
+  assert.deepEqual(JSON.parse(out[1].parameters), { type: 'path', value: '/pricing' });
+  assert.match(out[1].report_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(
+    migrateLegacyReports([
+      {
+        ...base,
+        report_id: 'g1',
+        type: 'goals',
+        name: 'Goals',
+        parameters: '{"goals":[{"type":"url","value":"/pricing"}]}',
+      },
+    ])[0].report_id,
+    out[1].report_id,
+  );
+  assert.equal(out[3].parameters, '{"a":1}');
+}
 
 console.log('d1 import SQL: OK');

@@ -20,8 +20,9 @@
  *     D1; a full run's validation reports them as D1 being ahead of the source.
  *
  * The source may still be on an older upstream schema. Tables it doesn't have yet are skipped
- * (D1 keeps them empty), columns it doesn't have get D1's defaults, and LEGACY_COLUMNS reads
- * renamed columns under their new names. Data changes of the D1 migrations that ran before
+ * (D1 keeps them empty), columns it doesn't have get D1's defaults, and the column and row
+ * changes of later upstream migrations (LEGACY_COLUMNS, LEGACY_SHARE, migrateLegacyReports)
+ * are replayed on the copy. Data changes of the D1 migrations that ran before
  * the import are repeated on the copy: session_data is deduplicated by its upsert key, and
  * 0008_lowercase_username runs again after `user` is copied.
  *
@@ -58,6 +59,7 @@
 
 import 'dotenv/config';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -77,6 +79,8 @@ type Args = {
   allowDrop: Set<string>;
   // Source columns a LegacySource rebuilds into another table; not dropped data.
   moved: Set<string>;
+  // Source columns with no D1 home, collected across tables so one run reports them all.
+  refused: string[];
 };
 
 function parseArgs(): Args {
@@ -113,6 +117,7 @@ function parseArgs(): Args {
     exclude: list('exclude'),
     allowDrop: list('allow-drop'),
     moved: new Set<string>(),
+    refused: [],
   };
   // Without --since a post-flip pass re-imports every event into the live D1.
   if (args.skipMutable && !args.since && !args.validateOnly) {
@@ -135,6 +140,8 @@ type TableSpec = {
   latestPer?: string[];
   after?: string;
   legacy?: LegacySource;
+  // Row rewrite for sources lacking table `unless` (i.e. predating the migration that made it).
+  rewrite?: { unless: string; rows: (rows: Record<string, any>[]) => Record<string, any>[] };
 };
 
 // A table an older source doesn't have yet but whose data it keeps elsewhere: when `column`
@@ -184,7 +191,7 @@ const TABLES: TableSpec[] = [
   // still has duplicates (before upstream's 23_update_session_data) or a row was rewritten,
   // and after the flip an older Supabase row never displaces a newer D1-native one.
   { name: 'session_data', appendOnly: true, latestPer: ['session_id', 'data_key'] },
-  { name: 'report' },
+  { name: 'report', rewrite: { unless: 'link', rows: migrateLegacyReports } },
   { name: 'segment' },
   { name: 'annotation' },
   { name: 'revenue', appendOnly: true },
@@ -202,23 +209,96 @@ const TABLES: TableSpec[] = [
 // api_key), which then stay empty in D1. Missing one of these means the wrong database.
 const CORE_TABLES = new Set(['user', 'website', 'session', 'website_event']);
 
-// Source columns that a later upstream migration renamed, for sources that haven't run it:
-// read `from` as `to`, with `select` giving the source SQL for the affected D1 columns, the
-// same transform the migration applies.
-const LEGACY_COLUMNS: Record<string, { from: string; to: string; select: Record<string, string> }> =
+// Column changes of later upstream migrations, replayed for sources that haven't run them
+// (the source itself is only read). Applies to `table` when the source has column `has` and
+// lacks `lacks`. `rename`: source column → D1 column. `select`: source SQL for a D1 column.
+// `discard`: source columns the migration drops, so not data the import loses.
+type LegacyColumns = {
+  migration: string;
+  table: string;
+  has: string;
+  lacks: string;
+  rename?: Record<string, string>;
+  select?: Record<string, string>;
+  discard?: string[];
+};
+const LEGACY_COLUMNS: LegacyColumns[] = [
+  {
+    // session.subdivision1 became region; hostname moved to website_event (next entry).
+    migration: '09_update_hostname_region',
+    table: 'session',
+    has: 'subdivision1',
+    lacks: 'region',
+    rename: { subdivision1: 'region' },
+    discard: ['subdivision2', 'hostname'],
+  },
+  {
+    migration: '09_update_hostname_region',
+    table: 'website_event',
+    has: 'session_id',
+    lacks: 'hostname',
+    select: {
+      hostname: `(SELECT s."hostname" FROM "session" s WHERE s."session_id" = "website_event"."session_id")`,
+    },
+  },
   {
     // 20_add_heatmap (D1 0004): the flag moved into replay_config.replayEnabled.
-    website: {
-      from: 'replay_enabled',
-      to: 'recorder_enabled',
-      select: {
-        recorder_enabled: '"replay_enabled"',
-        replay_config:
-          `CASE WHEN "replay_enabled" THEN COALESCE("replay_config", '{}'::jsonb)` +
-          ` || '{"replayEnabled": true}'::jsonb ELSE "replay_config" END`,
-      },
+    migration: '20_add_heatmap',
+    table: 'website',
+    has: 'replay_enabled',
+    lacks: 'recorder_enabled',
+    rename: { replay_enabled: 'recorder_enabled' },
+    select: {
+      recorder_enabled: '"replay_enabled"',
+      replay_config:
+        `CASE WHEN "replay_enabled" THEN COALESCE("replay_config", '{}'::jsonb)` +
+        ` || '{"replayEnabled": true}'::jsonb ELSE "replay_config" END`,
     },
-  };
+  },
+];
+
+// Deterministic UUID for rows a legacy rewrite creates, so re-runs upsert the same rows.
+function derivedId(...parts: string[]) {
+  const h = createHash('md5').update(parts.join(':')).digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+// 14_add_link_and_pixel rewrote saved reports: one-step funnels deleted, funnel steps of type
+// 'url' became 'path' (and websiteId/dateRange/urls left the parameters), and each 'goals'
+// report became one 'goal' report per event/url goal. Runs on transformed rows (parameters as
+// JSON text) for sources that predate the migration.
+export function migrateLegacyReports(rows: Record<string, any>[]) {
+  const out: Record<string, any>[] = [];
+  for (const row of rows) {
+    const params = row.parameters ? JSON.parse(row.parameters) : {};
+    const type = row.type === 'goals' ? 'goal' : row.type;
+    if (type === 'funnel') {
+      if (Array.isArray(params.steps) && params.steps.length === 1) continue;
+      const { websiteId, dateRange, urls, ...rest } = params;
+      if (Array.isArray(rest.steps)) {
+        rest.steps = rest.steps.map((s: any) => (s?.type === 'url' ? { ...s, type: 'path' } : s));
+      }
+      out.push({ ...row, type, parameters: JSON.stringify(rest) });
+    } else if (type === 'goal' && Array.isArray(params.goals)) {
+      params.goals.forEach((goal: any, i: number) => {
+        if (goal?.type !== 'event' && goal?.type !== 'url') return;
+        out.push({
+          ...row,
+          report_id: derivedId(row.report_id, String(i)),
+          type,
+          name: `${row.name} - ${goal.value}`,
+          parameters: JSON.stringify({
+            type: goal.type === 'url' ? 'path' : goal.type,
+            value: goal.value,
+          }),
+        });
+      });
+    } else {
+      out.push({ ...row, type });
+    }
+  }
+  return out;
+}
 
 const FETCH_ROWS = 500; // rows per cursor FETCH, and per .sql file
 // D1 rejects any single statement over 100 KB (SQLITE_TOOBIG). Statements are packed by UTF-8
@@ -318,7 +398,25 @@ async function main() {
     );
     source[spec.name] = { n: Number(r.n), max: transformValue(r.m, 'timestamp with time zone') };
     console.log(`== ${spec.name}: ${r.n} rows${since ? ` since ${since}` : ''} ==`);
-    if (!args.validateOnly) files.push(...(await copyTable(pg, spec, args, dropped, legacy)));
+    const rewrite =
+      spec.rewrite && !(await present(spec.rewrite.unless)) ? spec.rewrite : undefined;
+    if (rewrite) console.log(`  source predates ${rewrite.unless}; rewriting ${spec.name} rows`);
+    if (!args.validateOnly) {
+      const copied = await copyTable(pg, spec, args, dropped, legacy, rewrite?.rows);
+      files.push(...copied.files);
+      // A rewrite adds/removes rows, so D1 should match what was written.
+      if (rewrite) source[spec.name].n = copied.written;
+    } else if (rewrite) {
+      console.log(`  (${spec.name} count compares source rows before the rewrite)`);
+    }
+  }
+  if (args.refused.length) {
+    throw new Error(
+      `source columns missing from the D1 schema: ${args.refused.join(', ')}. Add them to ` +
+        `src/db/d1/schema.ts + a D1 migration (or a LEGACY_COLUMNS entry if an upstream ` +
+        `migration moved them), or drop their data: --allow-drop=${args.refused.join(',')}. ` +
+        'Nothing was applied to D1.',
+    );
   }
   await pg.query('COMMIT');
   await pg.end();
@@ -372,6 +470,7 @@ async function copyTable(
   args: Args,
   dropped: string[],
   legacy?: LegacySource,
+  rewrite?: (rows: Record<string, any>[]) => Record<string, any>[],
 ) {
   const { pk } = D1_TABLES[spec.name];
   const cols = legacy ? legacy.columns : await getColumns(pg, spec.name, args, dropped);
@@ -399,14 +498,15 @@ async function copyTable(
   while (true) {
     const { rows } = await pg.query(`FETCH ${FETCH_ROWS} FROM migrate_cursor`);
     if (rows.length === 0) break;
-    const values = rows.map(r => transformRow(r, cols));
+    const transformed = rows.map(r => transformRow(r, cols));
+    const values = rewrite ? rewrite(transformed) : transformed;
     write(
       buildStatements(spec.name, names, pk, values, {
         wipe: wipe && !files.length,
         latestPer: spec.latestPer,
       }),
     );
-    written += rows.length;
+    written += values.length;
     process.stdout.write(`  ${written} rows written\r`);
   }
   await pg.query('CLOSE migrate_cursor');
@@ -414,16 +514,16 @@ async function copyTable(
   if (wipe && !files.length) write(buildStatements(spec.name, names, pk, [], { wipe }));
   if (spec.after) write([readFileSync(spec.after, 'utf8')]);
   console.log(`  ${written} rows written, ${files.length} batch file(s)`);
-  return files;
+  return { files, written };
 }
 
-// `select`: source SQL read under this name, for LEGACY_COLUMNS.
+// `select`: source SQL read under this name (LEGACY_COLUMNS, LegacySource).
 type ColumnInfo = { name: string; type: string; select?: string };
 
 async function getColumns(
   pg: Client,
   table: string,
-  { allowDrop, moved }: Pick<Args, 'allowDrop' | 'moved'>,
+  { allowDrop, moved, refused }: Pick<Args, 'allowDrop' | 'moved' | 'refused'>,
   dropped: string[],
 ): Promise<ColumnInfo[]> {
   const { rows } = await pg.query(
@@ -434,27 +534,32 @@ async function getColumns(
     [table],
   );
   const d1 = D1_TABLES[table].columns;
-  const legacy = LEGACY_COLUMNS[table];
-  const renamed =
-    legacy &&
-    rows.some(r => r.column_name === legacy.from) &&
-    !rows.some(r => r.column_name === legacy.to);
-  const cols: ColumnInfo[] = rows.map(r => {
-    if (!renamed) return { name: r.column_name, type: r.data_type };
-    const name = r.column_name === legacy.from ? legacy.to : r.column_name;
-    return { name, type: r.data_type, select: legacy.select[name] };
-  });
-  if (renamed) console.log(`  reading ${table}.${legacy.from} as ${legacy.to}`);
-  // A source column D1 has no place for would otherwise vanish with only a log line.
-  const extra = cols.filter(c => !d1.has(c.name)).map(c => `${table}.${c.name}`);
-  const refused = extra.filter(c => !allowDrop.has(c) && !moved.has(c));
-  if (refused.length) {
-    throw new Error(
-      `source columns missing from the D1 schema: ${refused.join(', ')}. Add them to ` +
-        `src/db/d1/schema.ts + a D1 migration, or drop their data: --allow-drop=${refused.join(',')}`,
-    );
+  const names = new Set(rows.map(r => r.column_name));
+  let cols: ColumnInfo[] = rows.map(r => ({ name: r.column_name, type: r.data_type }));
+  const discarded = new Set<string>();
+  for (const legacy of LEGACY_COLUMNS) {
+    if (legacy.table !== table || !names.has(legacy.has) || names.has(legacy.lacks)) continue;
+    console.log(`  source predates ${legacy.migration}; replaying its ${table} changes`);
+    cols = cols.map(c => {
+      const name = legacy.rename?.[c.name] ?? c.name;
+      return {
+        ...c,
+        name,
+        select: legacy.select?.[name] ?? (name !== c.name ? quoteIdent(c.name) : c.select),
+      };
+    });
+    for (const [name, select] of Object.entries(legacy.select ?? {})) {
+      if (!cols.some(c => c.name === name)) cols.push({ name, type: 'character varying', select });
+    }
+    for (const c of legacy.discard ?? []) discarded.add(`${table}.${c}`);
   }
-  dropped.push(...extra.filter(c => !moved.has(c)));
+  // A source column D1 has no place for would otherwise vanish with only a log line.
+  const extra = cols
+    .filter(c => !d1.has(c.name))
+    .map(c => `${table}.${c.name}`)
+    .filter(c => !moved.has(c) && !discarded.has(c));
+  refused.push(...extra.filter(c => !allowDrop.has(c)));
+  dropped.push(...extra.filter(c => allowDrop.has(c)));
   return cols.filter(c => d1.has(c.name));
 }
 
