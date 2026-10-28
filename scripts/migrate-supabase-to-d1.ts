@@ -75,6 +75,8 @@ type Args = {
   onlyTable?: string;
   exclude: Set<string>;
   allowDrop: Set<string>;
+  // Source columns a LegacySource rebuilds into another table; not dropped data.
+  moved: Set<string>;
 };
 
 function parseArgs(): Args {
@@ -110,6 +112,7 @@ function parseArgs(): Args {
     onlyTable: get('table'),
     exclude: list('exclude'),
     allowDrop: list('allow-drop'),
+    moved: new Set<string>(),
   };
   // Without --since a post-flip pass re-imports every event into the live D1.
   if (args.skipMutable && !args.since && !args.validateOnly) {
@@ -126,7 +129,40 @@ function parseArgs(): Args {
 // a partly applied run stays readable). `after`: a D1 SQL file run once the table is copied.
 // The two_factor_* tables hold short-lived state too (OTP replay window, lockouts); mirroring
 // them keeps a lockout in force across the cutover.
-type TableSpec = { name: string; appendOnly?: boolean; latestPer?: string[]; after?: string };
+type TableSpec = {
+  name: string;
+  appendOnly?: boolean;
+  latestPer?: string[];
+  after?: string;
+  legacy?: LegacySource;
+};
+
+// A table an older source doesn't have yet but whose data it keeps elsewhere: when `column`
+// exists in the source, the rows are rebuilt with `from` (selecting `columns`), the same
+// transform the upstream migration applies, and `column` counts as moved rather than dropped.
+type LegacySource = {
+  column: [string, string];
+  columns: ColumnInfo[];
+  from: string;
+  order: string;
+};
+
+// 15_add_share: a website's share link moved from website.share_id to a share row. The id is
+// derived from the website and slug so re-runs upsert the same row.
+const LEGACY_SHARE: LegacySource = {
+  column: ['website', 'share_id'],
+  columns: [
+    { name: 'share_id', type: 'uuid', select: `md5("website_id"::text || "share_id")::uuid` },
+    { name: 'entity_id', type: 'uuid', select: '"website_id"' },
+    { name: 'name', type: 'character varying', select: '"name"' },
+    { name: 'share_type', type: 'integer', select: '1' },
+    { name: 'slug', type: 'character varying', select: '"share_id"' },
+    { name: 'parameters', type: 'jsonb', select: `'{"overview":true}'::jsonb` },
+    { name: 'created_at', type: 'timestamp with time zone', select: 'now()' },
+  ],
+  from: '"website" WHERE "share_id" IS NOT NULL',
+  order: '"website_id"',
+};
 const TABLES: TableSpec[] = [
   // Usernames from a source that predates upstream's 24_lowercase_username still have
   // capitals, and logins look up the lowercased name. The file is idempotent.
@@ -155,7 +191,7 @@ const TABLES: TableSpec[] = [
   { name: 'link' },
   { name: 'pixel' },
   { name: 'board' },
-  { name: 'share' },
+  { name: 'share', legacy: LEGACY_SHARE },
   { name: 'session_replay', appendOnly: true },
   { name: 'session_replay_saved' },
   { name: 'heatmap_event', appendOnly: true },
@@ -242,11 +278,29 @@ async function main() {
     mkdirSync(OUTPUT_DIR, { recursive: true });
   }
 
+  const present = async (table: string) =>
+    (await pg.query('SELECT to_regclass($1) IS NOT NULL AS p', [`public.${table}`])).rows[0].p;
+  // Resolve legacy sources up front: the column they read (website.share_id) belongs to a table
+  // copied earlier, which must then accept it as moved.
+  const legacyFor = new Map<string, LegacySource>();
+  for (const spec of TABLES) {
+    if (!spec.legacy || (await present(spec.name))) continue;
+    const [t, c] = spec.legacy.column;
+    const { rows } = await pg.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema='public' AND table_name=$1 AND column_name=$2`,
+      [t, c],
+    );
+    if (rows.length) {
+      legacyFor.set(spec.name, spec.legacy);
+      args.moved.add(`${t}.${c}`);
+      console.log(`  ${t}.${c} predates the ${spec.name} table; rebuilding ${spec.name} from it`);
+    }
+  }
+
   for (const spec of tables) {
-    const { rows } = await pg.query('SELECT to_regclass($1) IS NOT NULL AS present', [
-      `public.${spec.name}`,
-    ]);
-    if (!rows[0]?.present) {
+    const legacy = legacyFor.get(spec.name);
+    if (!legacy && !(await present(spec.name))) {
       if (CORE_TABLES.has(spec.name)) throw new Error(`core table "${spec.name}" not in source`);
       missing.push(spec.name);
       continue;
@@ -260,11 +314,11 @@ async function main() {
       rows: [r],
     } = await pg.query(
       `SELECT count(${counted}) AS n, ${spec.appendOnly ? 'max(created_at)' : 'NULL'} AS m` +
-        ` FROM ${quoteIdent(spec.name)}${sinceFilter(since)}`,
+        ` FROM ${legacy ? legacy.from : quoteIdent(spec.name) + sinceFilter(since)}`,
     );
     source[spec.name] = { n: Number(r.n), max: transformValue(r.m, 'timestamp with time zone') };
     console.log(`== ${spec.name}: ${r.n} rows${since ? ` since ${since}` : ''} ==`);
-    if (!args.validateOnly) files.push(...(await copyTable(pg, spec, args, dropped)));
+    if (!args.validateOnly) files.push(...(await copyTable(pg, spec, args, dropped, legacy)));
   }
   await pg.query('COMMIT');
   await pg.end();
@@ -312,20 +366,27 @@ function sinceFilter(since?: string) {
   return since ? ` WHERE "created_at" >= ${sqlLit(since)}` : '';
 }
 
-async function copyTable(pg: Client, spec: TableSpec, args: Args, dropped: string[]) {
+async function copyTable(
+  pg: Client,
+  spec: TableSpec,
+  args: Args,
+  dropped: string[],
+  legacy?: LegacySource,
+) {
   const { pk } = D1_TABLES[spec.name];
-  const cols = await getColumns(pg, spec.name, args.allowDrop, dropped);
+  const cols = legacy ? legacy.columns : await getColumns(pg, spec.name, args, dropped);
   const names = cols.map(c => c.name);
   const since = spec.appendOnly ? args.since : undefined;
   // Mirror by emptying first, so rows deleted in Supabase leave D1 too. Append-only tables are
   // only upserted: wiping would force the full re-copy --since exists to avoid.
   const wipe = !spec.appendOnly;
   // created_at first so rows land in D1 in time order, which is how reports range-scan them.
-  const order = [...(spec.appendOnly ? ['created_at'] : []), ...pk].map(quoteIdent).join(', ');
+  const order =
+    legacy?.order ?? [...(spec.appendOnly ? ['created_at'] : []), ...pk].map(quoteIdent).join(', ');
   const select = cols.map(c => (c.select ? `${c.select} AS ` : '') + quoteIdent(c.name));
+  const from = legacy ? legacy.from : quoteIdent(spec.name) + sinceFilter(since);
   await pg.query(
-    `DECLARE migrate_cursor CURSOR FOR SELECT ${select.join(', ')}` +
-      ` FROM ${quoteIdent(spec.name)}${sinceFilter(since)} ORDER BY ${order}`,
+    `DECLARE migrate_cursor CURSOR FOR SELECT ${select.join(', ')} FROM ${from} ORDER BY ${order}`,
   );
 
   const files: string[] = [];
@@ -362,7 +423,7 @@ type ColumnInfo = { name: string; type: string; select?: string };
 async function getColumns(
   pg: Client,
   table: string,
-  allowDrop: Set<string>,
+  { allowDrop, moved }: Pick<Args, 'allowDrop' | 'moved'>,
   dropped: string[],
 ): Promise<ColumnInfo[]> {
   const { rows } = await pg.query(
@@ -386,14 +447,14 @@ async function getColumns(
   if (renamed) console.log(`  reading ${table}.${legacy.from} as ${legacy.to}`);
   // A source column D1 has no place for would otherwise vanish with only a log line.
   const extra = cols.filter(c => !d1.has(c.name)).map(c => `${table}.${c.name}`);
-  const refused = extra.filter(c => !allowDrop.has(c));
+  const refused = extra.filter(c => !allowDrop.has(c) && !moved.has(c));
   if (refused.length) {
     throw new Error(
       `source columns missing from the D1 schema: ${refused.join(', ')}. Add them to ` +
         `src/db/d1/schema.ts + a D1 migration, or drop their data: --allow-drop=${refused.join(',')}`,
     );
   }
-  dropped.push(...extra);
+  dropped.push(...extra.filter(c => !moved.has(c)));
   return cols.filter(c => d1.has(c.name));
 }
 
