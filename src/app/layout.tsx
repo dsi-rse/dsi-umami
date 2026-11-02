@@ -51,8 +51,8 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     metadataBase: getBaseUrl(headerStore),
     title: {
-      template: '%s | Umami',
-      default: 'Umami',
+      template: '%s | DSI Analytics',
+      default: 'DSI Analytics',
     },
   };
 }
