@@ -2,11 +2,16 @@ import clickhouse from '@/lib/clickhouse';
 import { DEFAULT_RESET_DATE } from '@/lib/constants';
 import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
 import prisma from '@/lib/prisma';
+import type { WebsiteDateRange } from '@/lib/types';
+import sqliteGetWebsiteDateRange from '@/queries/sqlite/getWebsiteDateRange';
 
-export async function getWebsiteDateRange(...args: [websiteId: string]) {
+export async function getWebsiteDateRange(
+  ...args: [websiteId: string]
+): Promise<WebsiteDateRange | null> {
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),
+    d1: () => sqliteGetWebsiteDateRange(...args),
   });
 }
 

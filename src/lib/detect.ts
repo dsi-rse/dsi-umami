@@ -1,11 +1,37 @@
 import path from 'node:path';
+import { getCloudflareContext } from '@opennextjs/cloudflare';
 import { browserName, detectOS } from 'detect-browser';
 import ipaddr from 'ipaddr.js';
-import isLocalhost from 'is-localhost-ip';
-import maxmind from 'maxmind';
 import { UAParser } from 'ua-parser-js';
 import { getIpAddress, stripPort } from '@/lib/ip';
 import { safeDecodeURIComponent } from '@/lib/url';
+
+// `is-localhost-ip` binds a socket (node:dgram) to test the address, which
+// hangs on workerd. ipaddr's range check covers the same loopback, private,
+// link-local and unique-local ranges synchronously.
+const LOCAL_RANGES = ['unspecified', 'loopback', 'private', 'linkLocal', 'uniqueLocal'];
+
+function isLocalIp(ip: string): boolean {
+  if (!ip) return true;
+  // Try the address as-is first: stripPort mangles IPv4-mapped IPv6.
+  for (const candidate of [ip, stripPort(ip).replace(/^\[|\]$/g, '')]) {
+    if (ipaddr.isValid(candidate)) {
+      return LOCAL_RANGES.includes(ipaddr.process(candidate).range());
+    }
+  }
+  return false;
+}
+
+// On Cloudflare Workers, request.cf always carries geo; the cf-ip* headers only
+// include region and city when the zone enables the visitor-location Managed
+// Transform. Outside Workers there is no context, so this returns undefined.
+function getCloudflareGeo() {
+  try {
+    return getCloudflareContext().cf;
+  } catch {
+    return undefined;
+  }
+}
 
 const MAXMIND = 'maxmind';
 
@@ -77,12 +103,23 @@ function decodeHeader(s: string | undefined | null): string | undefined | null {
 }
 
 export async function getLocation(ip: string = '', headers: Headers, skipHeaders: boolean) {
-  // Ignore local ips
-  if (!ip || (await isLocalhost(ip))) {
+  const cleanIp = stripPort(ip);
+
+  // Ignore local or invalid ips
+  if (isLocalIp(ip) || !cleanIp || !ipaddr.isValid(cleanIp)) {
     return null;
   }
 
   if (!skipHeaders && !process.env.SKIP_LOCATION_HEADERS) {
+    const cf = getCloudflareGeo();
+    if (cf?.country) {
+      return {
+        country: cf.country,
+        region: getRegionCode(cf.country, cf.regionCode),
+        city: cf.city,
+      };
+    }
+
     for (const provider of PROVIDER_HEADERS) {
       const countryHeader = headers.get(provider.countryHeader);
       if (countryHeader) {
@@ -99,16 +136,21 @@ export async function getLocation(ip: string = '', headers: Headers, skipHeaders
     }
   }
 
-  // Database lookup
+  // Database lookup — lazy-import maxmind so the worker bundle stays small
+  // on serverless runtimes (e.g. Cloudflare Workers) that get geo from
+  // request headers and never reach this fallback.
   if (!globalThis[MAXMIND]) {
+    const { default: maxmind } = await import('maxmind');
     const dir = path.join(process.cwd(), 'geo');
 
-    globalThis[MAXMIND] = await maxmind.open(
-      process.env.GEOLITE_DB_PATH || path.resolve(dir, 'GeoLite2-City.mmdb'),
-    );
+    // No GeoLite database is bundled on Workers; a lookup we can't do means
+    // "unknown location", not a failed event.
+    globalThis[MAXMIND] = await maxmind
+      .open(process.env.GEOLITE_DB_PATH || path.resolve(dir, 'GeoLite2-City.mmdb'))
+      .catch(() => null);
   }
 
-  const result = globalThis[MAXMIND]?.get(stripPort(ip));
+  const result = globalThis[MAXMIND]?.get(cleanIp);
 
   if (result) {
     const country = result.country?.iso_code ?? result?.registered_country?.iso_code;
@@ -140,31 +182,31 @@ export async function getClientInfo(request: Request, payload: Record<string, an
 export function hasBlockedIp(clientIp: string) {
   const ignoreIps = process.env.IGNORE_IP;
 
-  if (ignoreIps) {
-    const ips = [];
+  if (!clientIp || !ignoreIps) {
+    return false;
+  }
 
-    if (ignoreIps) {
-      ips.push(...ignoreIps.split(',').map(n => n.trim()));
+  const ips = ignoreIps.split(',').map(n => n.trim());
+
+  return ips.some(ip => {
+    if (ip === clientIp) {
+      return true;
     }
 
-    return ips.find(ip => {
-      if (ip === clientIp) {
-        return true;
-      }
-
-      // CIDR notation
-      if (ip.indexOf('/') > 0) {
+    // CIDR notation
+    if (ip.indexOf('/') > 0) {
+      try {
         const addr = ipaddr.parse(clientIp);
         const range = ipaddr.parseCIDR(ip);
 
         if (addr.kind() === range[0].kind() && addr.match(range)) {
           return true;
         }
+      } catch {
+        // Ignore parsing errors
       }
+    }
 
-      return false;
-    });
-  }
-
-  return false;
+    return false;
+  });
 }

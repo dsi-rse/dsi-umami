@@ -1,0 +1,281 @@
+/**
+ * Regression check for the SQL scripts/migrate-supabase-to-d1.ts writes: literal quoting,
+ * upsert shape, the per-statement byte budget, and that the output executes against the D1
+ * schema (prisma/migrations-d1, in an in-memory node:sqlite DB). Never touches Supabase or D1.
+ *
+ * Run: pnpm check-d1-import
+ */
+import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import {
+  buildStatements,
+  D1_TABLES,
+  migrateLegacyReports,
+  STATEMENT_BYTES,
+  sqlLit,
+  transformValue,
+} from './migrate-supabase-to-d1';
+
+const evil = `__BLOB__', '/x'); DELETE FROM "user"; --`;
+const bytes = (s: string) => Buffer.byteLength(s);
+
+// Literals: visitor text is always a quoted string, whatever it starts with.
+assert.equal(sqlLit(evil), `'__BLOB__'', ''/x''); DELETE FROM "user"; --'`);
+assert.equal(sqlLit(Buffer.from([0, 1, 0xab])), "x'0001ab'");
+assert.equal(sqlLit(transformValue(Buffer.from('hi'), 'bytea')), "x'6869'");
+for (const v of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, null, undefined]) {
+  assert.equal(sqlLit(v), 'NULL');
+}
+assert.equal(sqlLit(1.5), '1.5');
+assert.equal(sqlLit(true), '1');
+const when = new Date('2026-01-02T03:04:05.678Z');
+assert.equal(sqlLit(when), "'2026-01-02T03:04:05.678Z'");
+assert.equal(transformValue(when, 'timestamp with time zone'), '2026-01-02T03:04:05.678Z');
+assert.equal(sqlLit(transformValue({ a: "it's" }, 'jsonb')), `'{"a":"it''s"}'`);
+assert.equal(sqlLit({ a: [1] }), `'{"a":[1]}'`);
+assert.equal(transformValue(false, 'boolean'), 0);
+
+// Statement shape: pk upsert from the Drizzle schema, not INSERT OR REPLACE.
+assert.deepEqual(D1_TABLES.user.pk, ['user_id']);
+const userCols = ['user_id', 'username', 'password', 'role'];
+const user = (id: string, username: string) => ({
+  user_id: id,
+  username,
+  password: 'x',
+  role: 'user',
+});
+const userSql = (rows: Record<string, unknown>[], wipe = true) =>
+  buildStatements('user', userCols, D1_TABLES.user.pk, rows, { wipe }).join('');
+assert.equal(
+  buildStatements('user', userCols, ['user_id'], [user('u1', 'ann')]).join(''),
+  `INSERT INTO "user" ("user_id", "username", "password", "role") VALUES\n` +
+    `('u1', 'ann', 'x', 'user')\n` +
+    `ON CONFLICT ("user_id") DO UPDATE SET "username" = excluded."username", ` +
+    `"password" = excluded."password", "role" = excluded."role";\n`,
+);
+assert.deepEqual(buildStatements('user', userCols, ['user_id'], [], { wipe: true }), [
+  'DELETE FROM "user";\n',
+]);
+
+// Byte budget: multi-byte text, so a char-counting builder would overshoot.
+const eventCols = ['event_id', 'website_id', 'session_id', 'visit_id', 'url_path', 'page_title'];
+const events = Array.from({ length: 200 }, (_, i) => ({
+  event_id: `e${i}`,
+  website_id: 'w1',
+  session_id: 's1',
+  visit_id: 'v1',
+  url_path: '/',
+  page_title: `${i}${'é'.repeat(1500)}`,
+}));
+const eventStmts = buildStatements('website_event', eventCols, ['event_id'], events);
+assert.ok(eventStmts.length > 1);
+for (const s of eventStmts) assert.ok(bytes(s) <= STATEMENT_BYTES, `${bytes(s)} bytes`);
+const replay = {
+  replay_id: 'r1',
+  website_id: 'w1',
+  session_id: 's1',
+  visit_id: 'v1',
+  chunk_index: 0,
+  events: Buffer.alloc(16),
+  event_count: 1,
+  started_at: when.toISOString(),
+  ended_at: when.toISOString(),
+};
+const replayCols = Object.keys(replay);
+assert.throws(
+  () =>
+    buildStatements(
+      'session_replay',
+      replayCols,
+      ['replay_id'],
+      [{ ...replay, events: Buffer.alloc(STATEMENT_BYTES / 2) }],
+    ),
+  /session_replay row replay_id=r1 .*--exclude=session_replay/,
+);
+
+// Execute against the real D1 schema.
+const db = new DatabaseSync(':memory:');
+const dir = 'prisma/migrations-d1';
+for (const f of readdirSync(dir)
+  .filter(f => f.endsWith('.sql'))
+  .sort()) {
+  db.exec(readFileSync(`${dir}/${f}`, 'utf8'));
+}
+// node:sqlite rows have a null prototype; spread them so deepEqual compares plain objects.
+const all = (sql: string) =>
+  db
+    .prepare(sql)
+    .all()
+    .map(r => ({ ...r })) as Record<string, any>[];
+
+db.exec(eventStmts.join(''));
+assert.equal(all('SELECT count(*) AS n FROM website_event')[0].n, 200);
+assert.equal(
+  all(`SELECT page_title FROM website_event WHERE event_id = 'e7'`)[0].page_title,
+  events[7].page_title,
+);
+
+db.exec(buildStatements('session_replay', replayCols, ['replay_id'], [replay]).join(''));
+assert.deepEqual(Buffer.from(all('SELECT events FROM session_replay')[0].events), replay.events);
+
+// Mutable table: injection stored literally; re-applying is a no-op; DELETE-first drops
+// rows the source no longer has.
+const batch = userSql([user('u1', 'ann'), user('u2', evil)]);
+db.exec(batch);
+db.exec(batch);
+assert.deepEqual(all('SELECT user_id, username FROM "user" ORDER BY user_id'), [
+  { user_id: 'u1', username: 'ann' },
+  { user_id: 'u2', username: evil },
+]);
+db.exec(userSql([user('u1', 'ann2')], false)); // pk conflict updates in place
+assert.equal(all(`SELECT username FROM "user" WHERE user_id = 'u1'`)[0].username, 'ann2');
+// Another row's unique username is an error, not a silent delete as with INSERT OR REPLACE.
+assert.throws(() => db.exec(userSql([user('u3', 'ann2')], false)), /UNIQUE/);
+db.exec(userSql([user('u1', 'ann')]));
+assert.deepEqual(all('SELECT user_id FROM "user"'), [{ user_id: 'u1' }]);
+// Usernames from a source before upstream's lowercase migration: the import re-runs D1's.
+db.exec(userSql([user('u1', 'Ann'), user('u2', 'BOB')]));
+db.exec(readFileSync(`${dir}/0008_lowercase_username.sql`, 'utf8'));
+assert.deepEqual(all('SELECT username FROM "user" ORDER BY 1'), [
+  { username: 'ann' },
+  { username: 'bob' },
+]);
+
+// session_data keeps the latest row per (session_id, data_key), its unique key: a rewritten row
+// replaces the copy with the old id, and an older row never displaces a newer one.
+const sdCols = [
+  'session_data_id',
+  'website_id',
+  'session_id',
+  'data_key',
+  'string_value',
+  'data_type',
+  'created_at',
+];
+const sd = (id: string, key: string, at: string | null, value = 'x') => ({
+  session_data_id: id,
+  website_id: 'w1',
+  session_id: 's1',
+  data_key: key,
+  string_value: value,
+  data_type: 1,
+  created_at: at && `2026-01-0${at}T00:00:00.000Z`,
+});
+const sdSql = (rows: Record<string, unknown>[]) =>
+  buildStatements('session_data', sdCols, D1_TABLES.session_data.pk, rows, {
+    latestPer: ['session_id', 'data_key'],
+  }).join('');
+const sdRows = () =>
+  all('SELECT session_data_id, data_key, string_value FROM session_data ORDER BY 2');
+db.exec(sdSql([sd('old', 'plan', '1'), sd('k2', 'other', '1')]));
+db.exec(sdSql([sd('new', 'plan', '2')]));
+db.exec(sdSql([sd('older', 'plan', '1')]));
+db.exec(sdSql([sd('new', 'plan', '2')])); // re-applied: same pk and key
+assert.deepEqual(sdRows(), [
+  { session_data_id: 'k2', data_key: 'other', string_value: 'x' },
+  { session_data_id: 'new', data_key: 'plan', string_value: 'x' },
+]);
+// Duplicates within one batch (a source before upstream's session_data dedupe; NULL is
+// oldest), and a row rewritten in place with the same id and created_at.
+db.exec(
+  sdSql([sd('n1', 'dup', null), sd('d1', 'dup', '1'), sd('d2', 'dup', '2'), sd('d0', 'dup', null)]),
+);
+db.exec(sdSql([sd('k2', 'other', '1', 'y')]));
+assert.deepEqual(sdRows(), [
+  { session_data_id: 'd2', data_key: 'dup', string_value: 'x' },
+  { session_data_id: 'k2', data_key: 'other', string_value: 'y' },
+  { session_data_id: 'new', data_key: 'plan', string_value: 'x' },
+]);
+
+// Composite primary key (session_link) is the conflict target.
+assert.deepEqual(D1_TABLES.session_link.pk, ['website_id', 'distinct_id', 'session_id']);
+const link = {
+  website_id: 'w1',
+  session_id: 's1',
+  distinct_id: 'd1',
+  created_at: when.toISOString(),
+};
+const linkSql = buildStatements('session_link', Object.keys(link), D1_TABLES.session_link.pk, [
+  link,
+]).join('');
+db.exec(linkSql);
+db.exec(linkSql);
+assert.equal(all('SELECT count(*) AS n FROM session_link')[0].n, 1);
+
+// 14_add_link_and_pixel replay for pre-14 sources.
+{
+  const base = { user_id: 'u', website_id: 'w', description: '', created_at: null };
+  const out = migrateLegacyReports([
+    {
+      ...base,
+      report_id: 'f1',
+      type: 'funnel',
+      name: 'one step',
+      parameters: '{"steps":[{"type":"url","value":"/"}]}',
+    },
+    {
+      ...base,
+      report_id: 'f2',
+      type: 'funnel',
+      name: 'two steps',
+      parameters: JSON.stringify({
+        websiteId: 'w',
+        dateRange: {},
+        urls: ['/'],
+        window: 60,
+        steps: [
+          { type: 'url', value: '/' },
+          { type: 'event', value: 'signup' },
+        ],
+      }),
+    },
+    {
+      ...base,
+      report_id: 'g1',
+      type: 'goals',
+      name: 'Goals',
+      parameters: JSON.stringify({
+        goals: [
+          { type: 'url', value: '/pricing' },
+          { type: 'event', value: 'signup' },
+          { type: 'event-data', value: 'x' },
+        ],
+      }),
+    },
+    { ...base, report_id: 'r1', type: 'retention', name: 'kept', parameters: '{"a":1}' },
+  ]);
+  assert.deepEqual(
+    out.map(r => [r.type, r.name]),
+    [
+      ['funnel', 'two steps'],
+      ['goal', 'Goals - /pricing'],
+      ['goal', 'Goals - signup'],
+      ['retention', 'kept'],
+    ],
+  );
+  assert.deepEqual(JSON.parse(out[0].parameters), {
+    window: 60,
+    steps: [
+      { type: 'path', value: '/' },
+      { type: 'event', value: 'signup' },
+    ],
+  });
+  assert.deepEqual(JSON.parse(out[1].parameters), { type: 'path', value: '/pricing' });
+  assert.match(out[1].report_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(
+    migrateLegacyReports([
+      {
+        ...base,
+        report_id: 'g1',
+        type: 'goals',
+        name: 'Goals',
+        parameters: '{"goals":[{"type":"url","value":"/pricing"}]}',
+      },
+    ])[0].report_id,
+    out[1].report_id,
+  );
+  assert.equal(out[3].parameters, '{"a":1}');
+}
+
+console.log('d1 import SQL: OK');

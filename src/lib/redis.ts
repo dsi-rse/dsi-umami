@@ -102,10 +102,21 @@ class UmamiRedisClient {
   }
 }
 
+import { getKVClient, isKVAvailable } from './kv';
+
 const REDIS = 'redis';
-const enabled = !!process.env.REDIS_URL;
+// Opt-in Workers KV stand-in for Redis (CACHE_BACKEND=kv, see D1_FORK.md).
+// Enabling it also enables umami's Redis-only behavior: 1-hour login tokens
+// and 24-hour website/link/pixel caches.
+const useKVBackend =
+  !process.env.REDIS_URL && process.env.CACHE_BACKEND === 'kv' && isKVAvailable();
+const enabled = !!process.env.REDIS_URL || useKVBackend;
 
 function getClient() {
+  if (useKVBackend) {
+    return getKVClient() as unknown as UmamiRedisClient;
+  }
+
   const redis = new UmamiRedisClient(process.env.REDIS_URL);
   const originalConnect = redis.connect.bind(redis);
   let connectPromise: Promise<void> | null = null;

@@ -1,13 +1,24 @@
 import 'dotenv/config';
+import { initOpenNextCloudflareForDev } from '@opennextjs/cloudflare';
 import createNextIntlPlugin from 'next-intl/plugin';
 import pkg from './package.json' with { type: 'json' };
+import { getContentSecurityPolicy } from './src/lib/csp';
 
 const withNextIntl = createNextIntlPlugin('./src/i18n/request.ts');
 
+// Wire Cloudflare bindings (DB, CACHE, ASSETS) into `next dev` when CF_DEV=1.
+// No-op for Vercel / standalone Node deployments.
+if (process.env.CF_DEV) {
+  initOpenNextCloudflareForDev();
+}
+
 const TRACKER_SCRIPT = '/script.js';
+const RECORDER_SCRIPT = '/recorder.js';
 
 const isProd = process.env.NODE_ENV === 'production';
+const isVercel = Boolean(process.env.VERCEL);
 
+const apiUrl = process.env.API_URL || '';
 const basePath = process.env.BASE_PATH || '';
 const cloudMode = process.env.CLOUD_MODE || '';
 const cloudUrl = process.env.CLOUD_URL || '';
@@ -16,20 +27,18 @@ const corsMaxAge = process.env.CORS_MAX_AGE || '';
 const defaultCurrency = process.env.DEFAULT_CURRENCY || '';
 const defaultLocale = process.env.DEFAULT_LOCALE || '';
 const forceSSL = process.env.FORCE_SSL || '';
-const frameAncestors = process.env.ALLOWED_FRAME_URLS || '';
 const trackerScriptName = process.env.TRACKER_SCRIPT_NAME || '';
 const trackerScriptURL = process.env.TRACKER_SCRIPT_URL || '';
 const selfTrack = process.env.UMAMI_SELF_TRACK || '';
 const selfRecord = process.env.UMAMI_SELF_RECORD || '';
 
-const contentSecurityPolicy = `
-  default-src 'self';
-  img-src 'self' https: data:;
-  script-src 'self' 'unsafe-eval' 'unsafe-inline';
-  style-src 'self' 'unsafe-inline';
-  connect-src 'self' https:;
-  frame-ancestors 'self' ${frameAncestors};
-`;
+function isRelativeUrl(url: string) {
+  return Boolean(url && !/^https?:\/\//i.test(url));
+}
+
+function normalizePath(url: string) {
+  return `/${url.replace(/^\/+|\/+$/g, '')}`;
+}
 
 const defaultHeaders = [
   {
@@ -38,7 +47,7 @@ const defaultHeaders = [
   },
   {
     key: 'Content-Security-Policy',
-    value: contentSecurityPolicy.replace(/\s{2,}/g, ' ').trim(),
+    value: getContentSecurityPolicy(),
   },
 ];
 
@@ -99,6 +108,10 @@ if (isProd) {
     source: TRACKER_SCRIPT,
     headers: trackerHeaders,
   });
+  headers.push({
+    source: RECORDER_SCRIPT,
+    headers: trackerHeaders,
+  });
 }
 
 const rewrites = [];
@@ -120,6 +133,22 @@ if (collectApiEndpoint) {
     source: collectApiEndpoint,
     destination: '/api/send',
   });
+}
+
+if (isRelativeUrl(apiUrl)) {
+  const normalizedApiUrl = normalizePath(apiUrl);
+
+  if (normalizedApiUrl !== '/' && normalizedApiUrl !== '/api') {
+    headers.push({
+      source: `${normalizedApiUrl}/:path*`,
+      headers: apiHeaders,
+    });
+
+    rewrites.push({
+      source: `${normalizedApiUrl}/:path*`,
+      destination: '/api/:path*',
+    });
+  }
 }
 
 const redirects = [
@@ -186,7 +215,11 @@ if (isProd && cloudMode) {
 /** @type {import('next').NextConfig} */
 export default withNextIntl({
   reactStrictMode: false,
+  devIndicators: {
+    position: 'bottom-right',
+  },
   env: {
+    apiUrl,
     basePath,
     cloudMode,
     cloudUrl,
@@ -197,17 +230,28 @@ export default withNextIntl({
     selfRecord,
   },
   basePath,
-  output: 'standalone',
+  output: isVercel ? undefined : 'standalone',
   typescript: {
     ignoreBuildErrors: true,
   },
-  devIndicators: false,
+  experimental: {
+    useTypeScriptCli: true,
+  },
   async headers() {
     return headers;
   },
   async rewrites() {
     return [
       ...rewrites,
+      // Preserve legacy report requests outside the published API contract.
+      {
+        source: '/api/reports/:path*',
+        destination: '/compat/api/reports/:path*',
+      },
+      {
+        source: '/api/websites/:websiteId/reports',
+        destination: '/compat/api/websites/:websiteId/reports',
+      },
       {
         source: '/telemetry.js',
         destination: '/api/scripts/telemetry',

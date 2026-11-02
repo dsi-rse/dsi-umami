@@ -1,0 +1,47 @@
+/**
+ * Cloudflare Workers config for umami via @opennextjs/cloudflare.
+ *
+ * Local dev (local D1 + KV):  pnpm d1:migrate:local && pnpm cf:preview
+ * Deploy:                     pnpm cf:build && pnpm cf:deploy
+ *
+ * Required secret (not in this file): `wrangler secret put APP_SECRET`. Use
+ * the Vercel deployment's APP_SECRET (or, if it never set one, its
+ * DATABASE_URL string) so logins, share links and visitor IDs carry over.
+ * Bindings are local in dev; `wrangler d1 ... --remote` targets production.
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "umami",
+  "account_id": "afeb8c48d9711e23a14b014bcfaa01ea",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2025-12-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": ".open-next/assets"
+  },
+  "observability": {
+    "enabled": true
+  },
+  // D1 binding for the SQLite-backed umami database.
+  // Code references this as env.DB (see src/lib/drizzle-d1.ts).
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "umami",
+      "database_id": "44c526d2-2153-47c5-b982-6751822949b6",
+      "migrations_dir": "prisma/migrations-d1"
+    }
+  ],
+  // KV namespace for the opt-in Redis stand-in (src/lib/kv.ts). Only used when
+  // CACHE_BACKEND=kv; see D1_FORK.md for the behavior that turns on.
+  "kv_namespaces": [
+    {
+      "binding": "CACHE",
+      "id": "03b7870a309a4b4abcc3e6a4546b0f86"
+    }
+  ],
+  "vars": {
+    "DATABASE_FLAVOR": "d1"
+  }
+}
