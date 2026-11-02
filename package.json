@@ -10,6 +10,7 @@
     "url": "https://github.com/umami-software/umami.git"
   },
   "type": "module",
+  "packageManager": "pnpm@12.3.4",
   "engines": {
     "pnpm": "12.3.4"
   },
