@@ -48,9 +48,68 @@ type DB = DrizzleD1Database<typeof schema>;
 
 const DRIZZLE_D1 = 'drizzle-d1';
 
+// D1 rejects a query with "D1 DB is overloaded" when the database has used too
+// much CPU and memory in a 10-second window, e.g. a dashboard firing ~20 range
+// scans at once. Failing would drop tracker events (/api/send doesn't retry) and
+// blank dashboard panels, so retry with backoff that outlasts the window. Writes
+// are safe to retry: inserts carry app-generated ids and a batch is atomic.
+const OVERLOADED = /D1 DB is overloaded/;
+const RETRY_DELAYS_MS = [500, 1000, 2000, 4000, 8000];
+
+async function retryOverloaded<T>(run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run();
+    } catch (e: any) {
+      const delay = RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || !OVERLOADED.test(e?.message)) throw e;
+      log(`D1 overloaded, retry ${attempt + 1} in ~${delay} ms`);
+      // Jitter, so a page's parallel requests don't retry in lockstep.
+      await new Promise(resolve => setTimeout(resolve, delay * (0.5 + Math.random())));
+    }
+  }
+}
+
+// The D1 binding with retryOverloaded around every statement and batch. batch()
+// needs the binding's own statement objects, so proxies map back to them.
+const statementTargets = new WeakMap<object, any>();
+
+function retryingStatement(stmt: any): any {
+  const proxy = new Proxy(stmt, {
+    get(target, prop) {
+      if (prop === 'bind') return (...args: any[]) => retryingStatement(target.bind(...args));
+      const value = Reflect.get(target, prop, target);
+      if (typeof value !== 'function') return value;
+      if (prop === 'all' || prop === 'run' || prop === 'raw' || prop === 'first') {
+        return (...args: any[]) => retryOverloaded(() => value.apply(target, args));
+      }
+      return value.bind(target);
+    },
+  });
+  statementTargets.set(proxy, stmt);
+  return proxy;
+}
+
+function retryingD1(d1: D1Database): D1Database {
+  return new Proxy(d1, {
+    get(target, prop) {
+      if (prop === 'prepare') return (query: string) => retryingStatement(target.prepare(query));
+      if (prop === 'batch') {
+        return (statements: any[]) =>
+          retryOverloaded(() => target.batch(statements.map(s => statementTargets.get(s) ?? s)));
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 function getClient(): DB {
   const { env } = getCloudflareContext();
-  const db = drizzle((env as any).DB as D1Database, { schema, logger: !!process.env.LOG_QUERY });
+  const db = drizzle(retryingD1((env as any).DB as D1Database), {
+    schema,
+    logger: !!process.env.LOG_QUERY,
+  });
   log('Drizzle D1 initialized');
   return db;
 }
@@ -1174,8 +1233,7 @@ async function rawQuery(sqlText: string, data: Record<string, any>, name?: strin
 
   // Use the raw D1 binding directly — Drizzle's sql.raw doesn't support
   // separate parameter binding cleanly for arbitrary SQL strings.
-  const { env } = getCloudflareContext();
-  const stmt = (env as any).DB.prepare(query);
+  const stmt = (db as any).$client.prepare(query);
   const bound = params.length ? stmt.bind(...params) : stmt;
   const { results } = await bound.all();
   return results;

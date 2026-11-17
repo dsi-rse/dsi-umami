@@ -102,6 +102,10 @@ entry when an upstream query filters or includes a new relation.
 
 D1-specific behavior in the compat layer:
 
+- Every statement and batch is retried with backoff (about 15 s in total)
+  when D1 rejects it as overloaded: a database that used too much CPU in a
+  10-second window, as a dashboard's ~20 parallel range scans can. Without it,
+  tracker events arriving during a dashboard load are dropped.
 - Writes drop `undefined` keys (Prisma semantics), coerce Date → ISO string,
   boolean → 0/1, BigInt → number. JSON columns use Drizzle's json mode.
 - `createMany` splits rows so no statement binds more than 100 parameters.
