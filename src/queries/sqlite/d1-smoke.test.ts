@@ -35,6 +35,17 @@ Object.assign((sqlite as unknown as { limits: Record<string, number> }).limits, 
 
 const D1_MAX_PARAMS = 100;
 
+// Calls left that the fake rejects the way D1 does when it rate-limits a database.
+let overloads = 0;
+function maybeOverload() {
+  if (overloads > 0) {
+    overloads--;
+    throw new Error(
+      'D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 second window.',
+    );
+  }
+}
+
 function statement(sql: string, params: any[] = []) {
   const rows = (arrays = false) => {
     const stmt = sqlite.prepare(sql);
@@ -54,6 +65,7 @@ function statement(sql: string, params: any[] = []) {
     },
     // Like D1, writes report meta.changes (batch() runs everything through all()).
     all: async () => {
+      maybeOverload();
       const stmt = sqlite.prepare(sql);
       if (stmt.columns().length) return { success: true, results: rows(), meta: {} };
       const { changes } = stmt.run(...params);
@@ -68,6 +80,7 @@ function statement(sql: string, params: any[] = []) {
 const fakeD1 = {
   prepare: (sql: string) => statement(sql),
   async batch(statements: ReturnType<typeof statement>[]) {
+    maybeOverload();
     sqlite.exec('begin');
     try {
       const results = [];
@@ -1114,6 +1127,21 @@ describe('D1 compat layer', () => {
   const prisma = async () => (await import('@/lib/prisma')).default;
   const count = (table: string, where: string) =>
     (sqlite.prepare(`select count(*) n from ${table} where ${where}`).get() as { n: number }).n;
+
+  test('retries reads and writes that D1 rejects as overloaded', async () => {
+    const { client, rawQuery } = await prisma();
+    overloads = 2;
+    expect(await rawQuery('select 1 as one', {})).toEqual([{ one: 1 }]);
+    overloads = 1;
+    await client.appSetting.create({ data: { key: 'retried', value: 'x' } });
+    expect(count('app_setting', "key = 'retried'")).toBe(1);
+    expect(overloads).toBe(0);
+  });
+
+  test('other D1 errors fail without a retry', async () => {
+    const { rawQuery } = await prisma();
+    await expect(rawQuery('select * from no_such_table', {})).rejects.toThrow(/no such table/);
+  });
 
   test('upsert inserts, then updates with increment', async () => {
     const { client } = await prisma();
